@@ -5,7 +5,6 @@ Scan milk telemetry files on filesystem
 Usage:
 milk-streamtelemetry-scan <dir> <tstart> <tend>
 
-
 List telemetry files that contain frames between unix time stamps <tstart> and <tend> in directory <dir>. 
 
 The program looks at timing files in the YYYYMMDD director(ies) matching the time range specified.
