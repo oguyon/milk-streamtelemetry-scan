@@ -1,6 +1,7 @@
 # milk-streamtelemetry-scan
 
 Scan milk telemetry files on filesystem
+Note: Telemetry format is specified in file TelemetryFormat.md in this repo.
 
 Usage:
 milk-streamtelemetry-scan <dir> <tstart> <tend>
