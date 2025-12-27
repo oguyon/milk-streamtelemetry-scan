@@ -132,6 +132,30 @@ void scan_stream_dir(const char *path, const char *stream_name, double tstart, d
     closedir(d);
 }
 
+double parse_time_arg(const char *arg) {
+    if (strncmp(arg, "UT", 2) == 0) {
+        // Parse UTYYYYMMDDTHH:MM:SS
+        struct tm tm_val;
+        memset(&tm_val, 0, sizeof(struct tm));
+        int year, month, day, hour, minute, second;
+        // UTYYYYMMDDTHH:MM:SS
+        if (sscanf(arg, "UT%4d%2d%2dT%2d:%2d:%2d", &year, &month, &day, &hour, &minute, &second) == 6) {
+            tm_val.tm_year = year - 1900;
+            tm_val.tm_mon = month - 1;
+            tm_val.tm_mday = day;
+            tm_val.tm_hour = hour;
+            tm_val.tm_min = minute;
+            tm_val.tm_sec = second;
+            return (double)timegm(&tm_val);
+        } else {
+             fprintf(stderr, "Warning: Failed to parse UT time format: %s. usage: UTYYYYMMDDTHH:MM:SS\n", arg);
+             return 0.0;
+        }
+    } else {
+        return atof(arg);
+    }
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 4) {
         fprintf(stderr, "Usage: %s <dir> <tstart> <tend>\n", argv[0]);
@@ -139,8 +163,8 @@ int main(int argc, char *argv[]) {
     }
 
     char *root_dir = argv[1];
-    double tstart = atof(argv[2]);
-    double tend = atof(argv[3]);
+    double tstart = parse_time_arg(argv[2]);
+    double tend = parse_time_arg(argv[3]);
 
     if (tstart >= tend) {
         fprintf(stderr, "Error: tstart must be less than tend\n");
