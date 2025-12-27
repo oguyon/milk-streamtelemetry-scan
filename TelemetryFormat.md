@@ -2,6 +2,8 @@
 
 Telemetry refers to time sequences of 2D images saved as 3D FITS files, along with auxiliary ASCII files.
 
+A sample of telemetry is included in this repo (directory telemetrysample), containing both timing data and header files. The FITS files are not included due to storage space.
+
 ## Naming conventions
 
 Telemetry files for stream “sname” acquired at date YYYYMMDD, at UT time hh:mm:ss.sssssssss, is stored in consecutive sets of the following 3 files:
