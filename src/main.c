@@ -134,12 +134,13 @@ void scan_stream_dir(const char *path, const char *stream_name, double tstart, d
 
 double parse_time_arg(const char *arg) {
     if (strncmp(arg, "UT", 2) == 0) {
-        // Parse UTYYYYMMDDTHH:MM:SS
+        // Parse UTYYYYMMDDTHH:MM:SS (MM and SS optional)
         struct tm tm_val;
         memset(&tm_val, 0, sizeof(struct tm));
-        int year, month, day, hour, minute, second;
-        // UTYYYYMMDDTHH:MM:SS
-        if (sscanf(arg, "UT%4d%2d%2dT%2d:%2d:%2d", &year, &month, &day, &hour, &minute, &second) == 6) {
+        int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+
+        int count = sscanf(arg, "UT%4d%2d%2dT%2d:%2d:%2d", &year, &month, &day, &hour, &minute, &second);
+        if (count >= 4) {
             tm_val.tm_year = year - 1900;
             tm_val.tm_mon = month - 1;
             tm_val.tm_mday = day;
@@ -148,7 +149,7 @@ double parse_time_arg(const char *arg) {
             tm_val.tm_sec = second;
             return (double)timegm(&tm_val);
         } else {
-             fprintf(stderr, "Warning: Failed to parse UT time format: %s. usage: UTYYYYMMDDTHH:MM:SS\n", arg);
+             fprintf(stderr, "Warning: Failed to parse UT time format: %s. usage: UTYYYYMMDDTHH[:MM[:SS]]\n", arg);
              return 0.0;
         }
     } else {
