@@ -156,6 +156,15 @@ double parse_time_arg(const char *arg) {
     }
 }
 
+void format_time_iso(double ts, char *buf, size_t size) {
+    time_t t = (time_t)ts;
+    struct tm tm_val;
+    gmtime_r(&t, &tm_val);
+    snprintf(buf, size, "UT%04d%02d%02dT%02d:%02d:%02d",
+             tm_val.tm_year + 1900, tm_val.tm_mon + 1, tm_val.tm_mday,
+             tm_val.tm_hour, tm_val.tm_min, tm_val.tm_sec);
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 4) {
         fprintf(stderr, "Usage: %s <dir> <tstart> <tend>\n", argv[0]);
@@ -250,6 +259,18 @@ int main(int argc, char *argv[]) {
 
     // Print output
     printf("Summary:\n");
+
+    char start_str[64];
+    char end_str[64];
+    format_time_iso(tstart, start_str, sizeof(start_str));
+    format_time_iso(tend, end_str, sizeof(end_str));
+
+    printf("Start: %s\n", start_str);
+    printf("End:   %s\n", end_str);
+
+    double dt_per_char = (tend - tstart) / timeline_width;
+    printf("Time per char: %.3f s\n", dt_per_char);
+
     for (int i = 0; i < stream_list.count; i++) {
         Stream *s = &stream_list.streams[i];
         if (s->total_frames > 0) {
@@ -257,6 +278,60 @@ int main(int argc, char *argv[]) {
         }
     }
     printf("\nTimeline:\n");
+
+    // Print Header
+    printf("%-*s ", name_width, "");
+
+    // Decide marker density
+    // We want to avoid printing finer markers if dt is large
+    // If dt < 2.0s: Show S
+    // If dt < 2.0m (120s): Show M
+    // If dt < 2.0h (7200s): Show H
+
+    int show_s = (dt_per_char < 2.0);
+    int show_m = (dt_per_char < 120.0);
+    int show_h = (dt_per_char < 7200.0);
+
+    for (int i = 0; i < timeline_width; i++) {
+        char marker = ' ';
+        // Determine time range of this bin: [t0, t1)
+        double t0 = tstart + i * dt_per_char;
+        double t1 = tstart + (i + 1) * dt_per_char;
+
+        // We check if a boundary is crossed within [t0, t1).
+        // Since we are looking for integer second/minute/hour boundaries,
+        // we can cast to time_t (which floors) and compare the start/end points.
+        // Actually, converting to struct tm allows checking larger units easily.
+
+        time_t time0 = (time_t)t0;
+        time_t time1 = (time_t)t1; // Note: if t1 is exactly integer, it belongs to next bin usually.
+        // However, standard "change" detection:
+
+        // Let's compare the struct tm of t0 and t1.
+        // If t1 is very close to integer, it might be the boundary itself.
+        // Let's use a slightly offset t1 to represent the 'end' inclusive?
+        // No, standard way: did the value change from t0 to t1?
+        // t0 = 0.9, t1 = 1.9 -> Sec 0 to Sec 1. Change.
+
+        if (time0 != time1) {
+            struct tm tm0;
+            struct tm tm1;
+            gmtime_r(&time0, &tm0);
+            gmtime_r(&time1, &tm1);
+
+            if (tm0.tm_year != tm1.tm_year || tm0.tm_yday != tm1.tm_yday) {
+                marker = 'D';
+            } else if (tm0.tm_hour != tm1.tm_hour) {
+                if (show_h) marker = 'H';
+            } else if (tm0.tm_min != tm1.tm_min) {
+                if (show_m) marker = 'M';
+            } else if (tm0.tm_sec != tm1.tm_sec) {
+                if (show_s) marker = 'S';
+            }
+        }
+        putchar(marker);
+    }
+    printf("\n");
 
     for (int i = 0; i < stream_list.count; i++) {
         Stream *s = &stream_list.streams[i];
