@@ -9,8 +9,6 @@
 #include <math.h>
 #include <sys/ioctl.h>
 
-#define _DEFAULT_SOURCE
-
 // ASCII Greyscale map
 const char *GREYSCALE = " .:-=+*#%@";
 
