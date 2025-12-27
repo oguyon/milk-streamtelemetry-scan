@@ -9,8 +9,21 @@
 #include <math.h>
 #include <sys/ioctl.h>
 
-// ASCII Greyscale map
-const char *GREYSCALE = " .:-=+*#%@";
+// Unicode Block Elements
+const char *BLOCKS[] = {" ", "\u2581", "\u2582", "\u2583", "\u2584", "\u2585", "\u2586", "\u2587", "\u2588"};
+// ANSI Colors (Blue -> Cyan -> Green -> Yellow -> Red)
+const char *COLORS[] = {
+    "\033[0m",        // 0: Reset (Space)
+    "\033[38;5;21m",  // 1: Blue
+    "\033[38;5;27m",  // 2: Blue-ish
+    "\033[38;5;39m",  // 3: Cyan
+    "\033[38;5;46m",  // 4: Green
+    "\033[38;5;118m", // 5: Light Green
+    "\033[38;5;154m", // 6: Yellow-Green
+    "\033[38;5;220m", // 7: Yellow
+    "\033[38;5;196m"  // 8: Red
+};
+#define RESET_COLOR "\033[0m"
 
 typedef struct {
     char name[256];
@@ -33,6 +46,7 @@ typedef struct {
     double ts;
     char status[16];
     char value[256];
+    char filename[256];
 } ReportLine;
 
 typedef struct {
@@ -252,6 +266,10 @@ KeyScanContext kscan_ctx;
 void process_header_for_key(const char *header_path, double file_timestamp) {
     char current_val[256];
     if (read_header_keyword(header_path, kscan_ctx.target_key, current_val)) {
+        // Extract basename
+        const char *base = strrchr(header_path, '/');
+        if (base) base++; else base = header_path;
+
         if (!kscan_ctx.has_last_value) {
             ReportLine line;
             line.is_count_line = 0;
@@ -259,6 +277,7 @@ void process_header_for_key(const char *header_path, double file_timestamp) {
             line.ts = file_timestamp;
             strcpy(line.status, "INITIAL");
             strncpy(line.value, current_val, 255);
+            strncpy(line.filename, base, 255);
             add_report_line(&kscan_ctx.report, line);
 
             strncpy(kscan_ctx.last_value, current_val, 255);
@@ -279,6 +298,7 @@ void process_header_for_key(const char *header_path, double file_timestamp) {
                 change_line.ts = file_timestamp;
                 strcpy(change_line.status, "CHANGE");
                 strncpy(change_line.value, current_val, 255);
+                strncpy(change_line.filename, base, 255);
                 add_report_line(&kscan_ctx.report, change_line);
 
                 strncpy(kscan_ctx.last_value, current_val, 255);
@@ -481,20 +501,14 @@ int main(int argc, char *argv[]) {
         snprintf(date_path, sizeof(date_path), "%s/%s", root_dir, date_str);
 
         if (is_directory(date_path)) {
-            // Scan subdirectories (streams)
-            // Need sorted stream names too if we want deterministic order?
-            // Ideally yes, but scan_stream_dir processes each stream fully.
-            // If user did not specify stream, we process all streams.
-            // For keyword scanning, mixing streams in output might be weird if single timeline.
-            // But let's assume we do it per stream dir visit.
-
-            struct dirent **namelist;
-            int n = scandir(date_path, &namelist, NULL, alphasort);
-            if (n >= 0) {
-                for (int i = 0; i < n; i++) {
-                    struct dirent *dir = namelist[i];
+            // Scan subdirectories (streams) - Sorted to ensure deterministic order (apapane, then ocam2d)
+            struct dirent **streamlist;
+            int n_stream = scandir(date_path, &streamlist, NULL, alphasort);
+            if (n_stream >= 0) {
+                for (int i = 0; i < n_stream; i++) {
+                    struct dirent *dir = streamlist[i];
                     if (dir->d_name[0] == '.') {
-                        free(namelist[i]);
+                        free(streamlist[i]);
                         continue;
                     }
 
@@ -504,9 +518,9 @@ int main(int argc, char *argv[]) {
                     if (is_directory(stream_path)) {
                         scan_stream_dir(stream_path, dir->d_name, tstart, tend, &stream_list, timeline_width);
                     }
-                    free(namelist[i]);
+                    free(streamlist[i]);
                 }
-                free(namelist);
+                free(streamlist);
             }
         }
     }
@@ -521,15 +535,10 @@ int main(int argc, char *argv[]) {
         ReportLine end_line;
         end_line.is_count_line = 0;
         strncpy(end_line.keyname, kscan_ctx.target_key, 79);
-        end_line.ts = 0; // No specific timestamp for END marker line value? Or last processed?
-                         // User said: "add line for ... end (last) value for the keyword"
-                         // Usually we just show the final state. Timestamp isn't really applicable or is the end of scan.
-                         // Let's use 0 or something else. User asked for "fields unix time, UT time...".
-                         // For "END" line, maybe use end time of scan? Or just leave blank?
-                         // Let's use 0.0 and handle printing to maybe show "-" or similar.
         end_line.ts = tend; // Use scan end time?
         strcpy(end_line.status, "END");
         strncpy(end_line.value, kscan_ctx.last_value, 255);
+        end_line.filename[0] = '\0'; // No file for end status
         add_report_line(&kscan_ctx.report, end_line);
     }
 
@@ -595,26 +604,30 @@ int main(int argc, char *argv[]) {
 
         for (int b = 0; b < timeline_width; b++) {
             int count = s->bins[b];
-            char c = ' ';
+            int idx = 0;
             if (count > 0) {
                 if (s->max_bin_count > 0) {
-                    int idx = 1 + (int)((double)count * 8.999 / s->max_bin_count);
-                    if (idx > 9) idx = 9;
+                    idx = 1 + (int)((double)count * 7.999 / s->max_bin_count);
+                    if (idx > 8) idx = 8;
                     if (idx < 1) idx = 1;
-                    c = GREYSCALE[idx];
                 } else {
-                    c = '.';
+                    idx = 1;
                 }
             }
-            putchar(c);
+            // Print with color
+            if (idx > 0) printf("%s", COLORS[idx]);
+            printf("%s", BLOCKS[idx]);
+            if (idx > 0) printf(RESET_COLOR);
         }
         printf("\n");
     }
 
-    printf("\nLegend: ' ' = 0 frames. Non-space characters show relative density (normalized to peak frame rate per stream).\n");
+    printf("\nLegend: ' ' = 0 frames. Blocks show relative density (normalized to peak frame rate per stream).\n");
     printf("Scale: ");
-    for (int i = 0; i < 10; i++) {
-        printf("%c", GREYSCALE[i]);
+    for (int i = 0; i < 9; i++) {
+        if (i > 0) printf("%s", COLORS[i]);
+        printf("%s", BLOCKS[i]);
+        if (i > 0) printf(RESET_COLOR);
     }
     printf(" (Low -> High density)\n");
 
@@ -639,13 +652,15 @@ int main(int argc, char *argv[]) {
                 char time_str[64];
                 format_time_iso(l->ts, time_str, sizeof(time_str));
 
-                // Keyname, UT time, unix time, status, Keyword value
-                printf("%-20s %-24s %-18.6f %-10s %s\n",
+                // Keyname, UT time, unix time, status, Keyword value, Filename
+                // Filename at the end
+                printf("%-20s %-24s %-18.6f %-10s %-20s %s\n",
                        l->keyname,
                        time_str,
                        l->ts,
                        l->status,
-                       l->value);
+                       l->value,
+                       l->filename);
             }
         }
     }
