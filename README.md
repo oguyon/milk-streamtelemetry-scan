@@ -1,7 +1,7 @@
 # milk-streamtelemetry-scan
 
 Scan milk telemetry files on filesystem
-Note: Telemetry format is specified in file TelemetryFormat.md in this repo.
+Note: Telemetry format is specified in file TelemetryFormat.md in this repo. An example telemetry directory is also provided (telemetrysample directory).
 
 ## Compilation
 Program is written in C, uses gcc and cmake for compilation
