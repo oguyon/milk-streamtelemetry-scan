@@ -26,12 +26,47 @@ typedef struct {
 } StreamList;
 
 typedef struct {
+    int is_count_line; // 1 if this is "XX files", 0 if change line
+    int count; // Used if is_count_line
+    // Used if !is_count_line
+    char keyname[80];
+    double ts;
+    char status[16];
+    char value[256];
+} ReportLine;
+
+typedef struct {
+    ReportLine *lines;
+    int count;
+    int capacity;
+} Report;
+
+typedef struct {
     char target_key[80];
     char target_stream[256]; // Empty if scanning all
     char last_value[256];
     int count_same_val;
     int has_last_value;
+    Report report;
 } KeyScanContext;
+
+void init_report(Report *r) {
+    r->count = 0;
+    r->capacity = 10;
+    r->lines = malloc(r->capacity * sizeof(ReportLine));
+}
+
+void add_report_line(Report *r, ReportLine line) {
+    if (r->count == r->capacity) {
+        r->capacity *= 2;
+        r->lines = realloc(r->lines, r->capacity * sizeof(ReportLine));
+    }
+    r->lines[r->count++] = line;
+}
+
+void free_report(Report *r) {
+    free(r->lines);
+}
 
 void init_stream_list(StreamList *list) {
     list->count = 0;
@@ -217,18 +252,34 @@ KeyScanContext kscan_ctx;
 void process_header_for_key(const char *header_path, double file_timestamp) {
     char current_val[256];
     if (read_header_keyword(header_path, kscan_ctx.target_key, current_val)) {
-        char time_str[64];
-        format_time_iso(file_timestamp, time_str, sizeof(time_str));
-
         if (!kscan_ctx.has_last_value) {
-            printf("Initial value: %s at %s\n", current_val, time_str);
+            ReportLine line;
+            line.is_count_line = 0;
+            strncpy(line.keyname, kscan_ctx.target_key, 79);
+            line.ts = file_timestamp;
+            strcpy(line.status, "INITIAL");
+            strncpy(line.value, current_val, 255);
+            add_report_line(&kscan_ctx.report, line);
+
             strncpy(kscan_ctx.last_value, current_val, 255);
             kscan_ctx.count_same_val = 1;
             kscan_ctx.has_last_value = 1;
         } else {
             if (strcmp(current_val, kscan_ctx.last_value) != 0) {
-                printf("Count with value %s: %d\n", kscan_ctx.last_value, kscan_ctx.count_same_val);
-                printf("%.3f %s %s %s\n", file_timestamp, time_str, kscan_ctx.last_value, current_val);
+                // Add count line
+                ReportLine count_line;
+                count_line.is_count_line = 1;
+                count_line.count = kscan_ctx.count_same_val;
+                add_report_line(&kscan_ctx.report, count_line);
+
+                // Add change line
+                ReportLine change_line;
+                change_line.is_count_line = 0;
+                strncpy(change_line.keyname, kscan_ctx.target_key, 79);
+                change_line.ts = file_timestamp;
+                strcpy(change_line.status, "CHANGE");
+                strncpy(change_line.value, current_val, 255);
+                add_report_line(&kscan_ctx.report, change_line);
 
                 strncpy(kscan_ctx.last_value, current_val, 255);
                 kscan_ctx.count_same_val = 1;
@@ -341,6 +392,7 @@ int main(int argc, char *argv[]) {
     kscan_ctx.target_key[0] = '\0';
     kscan_ctx.target_stream[0] = '\0';
     kscan_ctx.has_last_value = 0;
+    init_report(&kscan_ctx.report);
 
     int pos_arg_count = 0;
 
@@ -461,8 +513,24 @@ int main(int argc, char *argv[]) {
 
     // If we were scanning keys, we might have a final value pending
     if (kscan_ctx.has_last_value) {
-        printf("Count with value %s: %d\n", kscan_ctx.last_value, kscan_ctx.count_same_val);
-        printf("End value: %s\n", kscan_ctx.last_value);
+        ReportLine count_line;
+        count_line.is_count_line = 1;
+        count_line.count = kscan_ctx.count_same_val;
+        add_report_line(&kscan_ctx.report, count_line);
+
+        ReportLine end_line;
+        end_line.is_count_line = 0;
+        strncpy(end_line.keyname, kscan_ctx.target_key, 79);
+        end_line.ts = 0; // No specific timestamp for END marker line value? Or last processed?
+                         // User said: "add line for ... end (last) value for the keyword"
+                         // Usually we just show the final state. Timestamp isn't really applicable or is the end of scan.
+                         // Let's use 0 or something else. User asked for "fields unix time, UT time...".
+                         // For "END" line, maybe use end time of scan? Or just leave blank?
+                         // Let's use 0.0 and handle printing to maybe show "-" or similar.
+        end_line.ts = tend; // Use scan end time?
+        strcpy(end_line.status, "END");
+        strncpy(end_line.value, kscan_ctx.last_value, 255);
+        add_report_line(&kscan_ctx.report, end_line);
     }
 
     // Print output
@@ -473,18 +541,12 @@ int main(int argc, char *argv[]) {
     format_time_iso(tstart, start_str, sizeof(start_str));
     format_time_iso(tend, end_str, sizeof(end_str));
 
-    printf("Start: %s\n", start_str);
-    printf("End:   %s\n", end_str);
-
     double dt_per_char = (tend - tstart) / timeline_width;
-    printf("Time per char: %.3f s\n", dt_per_char);
+    double duration = tend - tstart;
 
-    for (int i = 0; i < stream_list.count; i++) {
-        Stream *s = &stream_list.streams[i];
-        if (s->total_frames > 0) {
-            printf("Stream %s: %ld frames\n", s->name, s->total_frames);
-        }
-    }
+    printf("Start: %s  End: %s  Duration: %.3f s  Bin: %.3f s\n",
+           start_str, end_str, duration, dt_per_char);
+
     printf("\nTimeline:\n");
 
     // Print Header
@@ -526,7 +588,10 @@ int main(int argc, char *argv[]) {
         Stream *s = &stream_list.streams[i];
         if (s->total_frames == 0) continue;
 
-        printf("%-*s ", name_width, s->name);
+        // [COUNT] STREAM_NAME
+        char name_buf[256];
+        snprintf(name_buf, sizeof(name_buf), "[%ld] %s", s->total_frames, s->name);
+        printf("%-*s ", name_width, name_buf);
 
         for (int b = 0; b < timeline_width; b++) {
             int count = s->bins[b];
@@ -553,6 +618,39 @@ int main(int argc, char *argv[]) {
     }
     printf(" (Low -> High density)\n");
 
+    // Print Keyword Report
+    if (kscan_ctx.report.count > 0) {
+        printf("\nKeyword Scan Report:\n");
+        // "Keyname, UT time, unix time, status (INITIAL, CHANGE, END) and Keyword value, all aligned."
+        // "Intermediate lines ... should start with 8 blanks chars and then print “XX files”"
+
+        // Define column widths
+        // Keyname: 20
+        // UT time: 24
+        // Unix time: 18
+        // Status: 10
+        // Value: rest
+
+        for (int i = 0; i < kscan_ctx.report.count; i++) {
+            ReportLine *l = &kscan_ctx.report.lines[i];
+            if (l->is_count_line) {
+                printf("        %d files\n", l->count);
+            } else {
+                char time_str[64];
+                format_time_iso(l->ts, time_str, sizeof(time_str));
+
+                // Keyname, UT time, unix time, status, Keyword value
+                printf("%-20s %-24s %-18.6f %-10s %s\n",
+                       l->keyname,
+                       time_str,
+                       l->ts,
+                       l->status,
+                       l->value);
+            }
+        }
+    }
+
+    free_report(&kscan_ctx.report);
     free_stream_list(&stream_list);
     return 0;
 }
