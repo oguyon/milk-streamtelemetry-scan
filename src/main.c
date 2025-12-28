@@ -24,6 +24,7 @@ const char *COLORS[] = {
     "\033[38;5;196m"  // 8: Red
 };
 #define RESET_COLOR "\033[0m"
+#define BOLD_COLOR "\033[1m"
 
 typedef struct {
     char name[256];
@@ -558,18 +559,35 @@ int main(int argc, char *argv[]) {
 
     printf("\nTimeline:\n");
 
-    // Calculate max label width for alignment
-    name_width = 20; // reset/ensure minimum
+    // Calculate max label widths for alignment
+    int max_name_len = 10;
+    int max_count_len = 5;
     for (int i = 0; i < stream_list.count; i++) {
         Stream *s = &stream_list.streams[i];
         if (s->total_frames == 0) continue;
-        char temp_buf[256];
-        int len = snprintf(temp_buf, sizeof(temp_buf), "[%ld] %s", s->total_frames, s->name);
-        if (len > name_width) name_width = len;
+        int len = strlen(s->name);
+        if (len > max_name_len) max_name_len = len;
+
+        char count_buf[32];
+        int clen = snprintf(count_buf, sizeof(count_buf), "%ld", s->total_frames);
+        if (clen > max_count_len) max_count_len = clen;
     }
 
+    // Total prefix width: Name + space + [ + Count + ] + space + FPS + space
+    // StreamName [Count] 1234.5 Hz
+    // Actual requested order: Stream name, number of frames, framerate, then framerate characters.
+    // "stream name, then number of frames, then framerate, then framerate characters"
+    // Let's format: "NAME   12345   123.4 Hz "
+
+    int prefix_width = max_name_len + 3 + max_count_len + 3 + 10 + 1;
+    // Name(max) + "   " + Count(max) + "   " + " 123.4 Hz "
+
+    // Adjust timeline width
+    timeline_width = term_width - prefix_width;
+    if (timeline_width < 10) timeline_width = 10;
+
     // Print Header
-    printf("%-*s ", name_width, "");
+    printf("%-*s ", prefix_width, "");
 
     int show_s = (dt_per_char < 2.0);
     int show_m = (dt_per_char < 120.0);
@@ -607,10 +625,17 @@ int main(int argc, char *argv[]) {
         Stream *s = &stream_list.streams[i];
         if (s->total_frames == 0) continue;
 
-        // [COUNT] STREAM_NAME
-        char name_buf[256];
-        snprintf(name_buf, sizeof(name_buf), "[%ld] %s", s->total_frames, s->name);
-        printf("%-*s ", name_width, name_buf);
+        // Calculate max FPS
+        double max_fps = 0.0;
+        if (dt_per_char > 0.0) {
+            max_fps = (double)s->max_bin_count / dt_per_char;
+        }
+
+        // Print prefix: Name(Bold) Count FPS
+        printf(BOLD_COLOR "%-*s" RESET_COLOR "   %*ld   %6.1f Hz ",
+               max_name_len, s->name,
+               max_count_len, s->total_frames,
+               max_fps);
 
         for (int b = 0; b < timeline_width; b++) {
             int count = s->bins[b];
@@ -629,12 +654,92 @@ int main(int argc, char *argv[]) {
             printf("%s", BLOCKS[idx]);
             if (idx > 0) printf(RESET_COLOR);
         }
+        printf("\n");
 
-        double max_fps = 0.0;
-        if (dt_per_char > 0.0) {
-            max_fps = (double)s->max_bin_count / dt_per_char;
+        // Render Keyword Timeline Row if scanning
+        if (kscan_ctx.target_key[0] != '\0') {
+            // Allocate buffer for timeline line
+            char *key_line = malloc(timeline_width + 1);
+            memset(key_line, ' ', timeline_width);
+            key_line[timeline_width] = '\0';
+
+            int has_key_entries = 0;
+
+            // Iterate report lines to fill key_line
+            // We assume report is sorted by time.
+            // Filter by stream name in filename
+
+            // First pass: Mark changes with '|'
+            for (int r = 0; r < kscan_ctx.report.count; r++) {
+                ReportLine *l = &kscan_ctx.report.lines[r];
+                if (l->is_count_line) continue;
+
+                // Check if filename matches stream
+                if (strncmp(l->filename, s->name, strlen(s->name)) != 0) continue;
+
+                // Map time to bin
+                if (l->ts >= tstart && l->ts <= tend) {
+                    int bin = (int)((l->ts - tstart) / (tend - tstart) * timeline_width);
+                    if (bin >= 0 && bin < timeline_width) {
+                        key_line[bin] = '|';
+                        has_key_entries = 1;
+                    }
+                }
+            }
+
+            // Second pass: Fill values
+            // We need to know the active value at each point.
+            // This is complex because we need to know the state before tstart for this stream.
+            // Simplified approach: Iterate bins. Find last report entry <= bin_time for this stream.
+
+            if (has_key_entries) {
+                for (int b = 0; b < timeline_width; b++) {
+                    if (key_line[b] == '|') continue;
+
+                    // Calc time for middle of bin? or start?
+                    double bin_time = tstart + (b + 0.5) * dt_per_char;
+
+                    // Find last event for this stream before bin_time
+                    const char *val = NULL;
+                    for (int r = 0; r < kscan_ctx.report.count; r++) {
+                        ReportLine *l = &kscan_ctx.report.lines[r];
+                        if (l->is_count_line) continue;
+                        if (strncmp(l->filename, s->name, strlen(s->name)) != 0) continue;
+
+                        if (l->ts <= bin_time) {
+                            val = l->value;
+                        } else {
+                            break; // Passed time
+                        }
+                    }
+
+                    // If we have a value and we are just after a pipe or start of line, print it
+                    if (val) {
+                        int prev_pipe = -1;
+                        for (int p = b - 1; p >= 0; p--) {
+                            if (key_line[p] == '|') {
+                                prev_pipe = p;
+                                break;
+                            }
+                        }
+
+                        // Distance from last pipe (or start)
+                        int dist = b - (prev_pipe == -1 ? -1 : prev_pipe);
+                        // Convert value char index: dist - 1 (1-based offset from pipe)
+                        int char_idx = dist - 1;
+                        if (char_idx >= 0 && char_idx < (int)strlen(val)) {
+                            key_line[b] = val[char_idx];
+                        }
+                    }
+                }
+
+                // Print the line
+                printf("%-*s ", prefix_width, "");
+                printf("%s\n", key_line);
+            }
+
+            free(key_line);
         }
-        printf(" %6.1f Hz\n", max_fps);
     }
 
     printf("\nLegend: ' ' = 0 frames. Blocks show relative density (normalized to peak frame rate per stream).\n");
