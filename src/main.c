@@ -578,8 +578,6 @@ int main(int argc, char *argv[]) {
     }
 
     // Print output
-    printf("\nSummary:\n");
-
     char start_str[64];
     char end_str[64];
     format_time_iso(tstart, start_str, sizeof(start_str));
@@ -588,10 +586,8 @@ int main(int argc, char *argv[]) {
     double dt_per_char = (tend - tstart) / timeline_width;
     double duration = tend - tstart;
 
-    printf("Start: %s  End: %s  Duration: %.3f s  Bin: %.3f s\n",
+    printf("\nStart: %s  End: %s  Duration: %.3f s  Bin: %.3f s\n\n",
            start_str, end_str, duration, dt_per_char);
-
-    printf("\nTimeline:\n");
 
     // Calculate max label widths for alignment
     int max_name_len = 10;
