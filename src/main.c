@@ -7,6 +7,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <math.h>
+#include <regex.h>
 #include <sys/ioctl.h>
 
 // Unicode Block Elements
@@ -43,6 +44,7 @@ typedef struct {
     int is_count_line; // 1 if this is "XX files", 0 if change line
     int count; // Used if is_count_line
     // Used if !is_count_line
+    char stream_name[256];
     char keyname[80];
     double ts;
     char status[16];
@@ -57,11 +59,22 @@ typedef struct {
 } Report;
 
 typedef struct {
-    char target_key[80];
-    char target_stream[256]; // Empty if scanning all
+    char stream_name[256];
+    char key[80];
     char last_value[256];
     int count_same_val;
     int has_last_value;
+} TrackedKey;
+
+typedef struct {
+    char target_key_pattern[256];
+    regex_t key_regex;
+    char target_stream[256]; // Empty if scanning all
+
+    TrackedKey *tracked_keys;
+    int tracked_count;
+    int tracked_capacity;
+
     Report report;
 } KeyScanContext;
 
@@ -228,87 +241,120 @@ void trim_fits_value(char *val) {
     memmove(val, start, strlen(start) + 1);
 }
 
-int read_header_keyword(const char *filepath, const char *key, char *value_out) {
-    FILE *fp = fopen(filepath, "r");
-    if (!fp) return 0;
+// Global context for keyword scanning
+KeyScanContext kscan_ctx;
 
-    char line[81]; // FITS header lines are 80 chars
-    int found = 0;
+TrackedKey* get_tracked_key(const char *stream, const char *key) {
+    for (int i = 0; i < kscan_ctx.tracked_count; i++) {
+        if (strcmp(kscan_ctx.tracked_keys[i].stream_name, stream) == 0 &&
+            strcmp(kscan_ctx.tracked_keys[i].key, key) == 0) {
+            return &kscan_ctx.tracked_keys[i];
+        }
+    }
+    if (kscan_ctx.tracked_count == kscan_ctx.tracked_capacity) {
+        kscan_ctx.tracked_capacity = (kscan_ctx.tracked_capacity == 0) ? 10 : kscan_ctx.tracked_capacity * 2;
+        kscan_ctx.tracked_keys = realloc(kscan_ctx.tracked_keys, kscan_ctx.tracked_capacity * sizeof(TrackedKey));
+    }
+    TrackedKey *tk = &kscan_ctx.tracked_keys[kscan_ctx.tracked_count++];
+    strncpy(tk->stream_name, stream, 255);
+    strncpy(tk->key, key, 79);
+    tk->key[79] = '\0';
+    tk->last_value[0] = '\0';
+    tk->count_same_val = 0;
+    tk->has_last_value = 0;
+    return tk;
+}
+
+void process_header_for_key(const char *header_path, const char *stream_name, double file_timestamp) {
+    FILE *fp = fopen(header_path, "r");
+    if (!fp) return;
+
+    char line[82]; // FITS header lines are 80 chars
 
     while (fgets(line, sizeof(line), fp)) {
-        if (strncmp(line, key, strlen(key)) == 0) {
-            // Check if followed by space or =
-            // FITS standard: KEYNAME = value / comment
-            // KEYNAME is usually 8 chars, padded with spaces if shorter.
-            // If key provided is shorter than 8 chars, we should check strict match?
-            // Let's assume user provides exact key string match at start.
+        // Parse key: chars before '=' or first 8 chars
+        // FITS: "KEYNAME = value"
+        char key[81];
+        char value[256];
+        int has_eq = 0;
+        char *eq_pos = strchr(line, '=');
 
-            char *eq_pos = strchr(line, '=');
-            if (eq_pos) {
-                // Value is after =
+        if (eq_pos) {
+            size_t key_len = eq_pos - line;
+            if (key_len > 80) key_len = 80;
+            strncpy(key, line, key_len);
+            key[key_len] = '\0';
+
+            // Trim key
+            char *end = key + strlen(key) - 1;
+            while (end >= key && (*end == ' ' || *end == '\t')) *end-- = '\0';
+
+            // Regex check
+            if (regexec(&kscan_ctx.key_regex, key, 0, NULL, 0) == 0) {
+                // Extract value
                 char *slash_pos = strchr(eq_pos, '/');
                 if (slash_pos) *slash_pos = '\0'; // Remove comment
 
-                strncpy(value_out, eq_pos + 1, 255);
-                value_out[255] = '\0';
-                trim_fits_value(value_out);
-                found = 1;
-                break;
+                strncpy(value, eq_pos + 1, 255);
+                value[255] = '\0';
+                trim_fits_value(value);
+
+                // Track state
+                TrackedKey *tk = get_tracked_key(stream_name, key);
+
+                // Extract basename
+                const char *base = strrchr(header_path, '/');
+                if (base) base++; else base = header_path;
+
+                if (!tk->has_last_value) {
+                    ReportLine rl;
+                    rl.is_count_line = 0;
+                    strncpy(rl.stream_name, stream_name, 255);
+                    strncpy(rl.keyname, key, 79);
+                    rl.ts = file_timestamp;
+                    strcpy(rl.status, "INITIAL");
+                    strncpy(rl.value, value, 255);
+                    strncpy(rl.filename, base, 255);
+                    add_report_line(&kscan_ctx.report, rl);
+
+                    strncpy(tk->last_value, value, 255);
+                    tk->count_same_val = 1;
+                    tk->has_last_value = 1;
+                } else {
+                    if (strcmp(value, tk->last_value) != 0) {
+                        // Add count line
+                        ReportLine count_line;
+                        count_line.is_count_line = 1;
+                        count_line.count = tk->count_same_val;
+                        // Count line needs keyname to associate?
+                        // The print logic assumes sequential.
+                        // But with multiple keys/streams, sequential might be mixed.
+                        // We store keyname in count line too just in case.
+                        strncpy(count_line.keyname, key, 79);
+                        strncpy(count_line.stream_name, stream_name, 255);
+                        add_report_line(&kscan_ctx.report, count_line);
+
+                        // Add change line
+                        ReportLine change_line;
+                        change_line.is_count_line = 0;
+                        strncpy(change_line.stream_name, stream_name, 255);
+                        strncpy(change_line.keyname, key, 79);
+                        change_line.ts = file_timestamp;
+                        strcpy(change_line.status, "CHANGE");
+                        strncpy(change_line.value, value, 255);
+                        strncpy(change_line.filename, base, 255);
+                        add_report_line(&kscan_ctx.report, change_line);
+
+                        strncpy(tk->last_value, value, 255);
+                        tk->count_same_val = 1;
+                    } else {
+                        tk->count_same_val++;
+                    }
+                }
             }
         }
     }
     fclose(fp);
-    return found;
-}
-
-// Global context for keyword scanning
-KeyScanContext kscan_ctx;
-
-void process_header_for_key(const char *header_path, double file_timestamp) {
-    char current_val[256];
-    if (read_header_keyword(header_path, kscan_ctx.target_key, current_val)) {
-        // Extract basename
-        const char *base = strrchr(header_path, '/');
-        if (base) base++; else base = header_path;
-
-        if (!kscan_ctx.has_last_value) {
-            ReportLine line;
-            line.is_count_line = 0;
-            strncpy(line.keyname, kscan_ctx.target_key, 79);
-            line.ts = file_timestamp;
-            strcpy(line.status, "INITIAL");
-            strncpy(line.value, current_val, 255);
-            strncpy(line.filename, base, 255);
-            add_report_line(&kscan_ctx.report, line);
-
-            strncpy(kscan_ctx.last_value, current_val, 255);
-            kscan_ctx.count_same_val = 1;
-            kscan_ctx.has_last_value = 1;
-        } else {
-            if (strcmp(current_val, kscan_ctx.last_value) != 0) {
-                // Add count line
-                ReportLine count_line;
-                count_line.is_count_line = 1;
-                count_line.count = kscan_ctx.count_same_val;
-                add_report_line(&kscan_ctx.report, count_line);
-
-                // Add change line
-                ReportLine change_line;
-                change_line.is_count_line = 0;
-                strncpy(change_line.keyname, kscan_ctx.target_key, 79);
-                change_line.ts = file_timestamp;
-                strcpy(change_line.status, "CHANGE");
-                strncpy(change_line.value, current_val, 255);
-                strncpy(change_line.filename, base, 255);
-                add_report_line(&kscan_ctx.report, change_line);
-
-                strncpy(kscan_ctx.last_value, current_val, 255);
-                kscan_ctx.count_same_val = 1;
-            } else {
-                kscan_ctx.count_same_val++;
-            }
-        }
-    }
 }
 
 void scan_stream_dir(const char *path, const char *stream_name, double tstart, double tend, StreamList *streams, int num_bins) {
@@ -329,16 +375,8 @@ void scan_stream_dir(const char *path, const char *stream_name, double tstart, d
             char filepath[1024];
             snprintf(filepath, sizeof(filepath), "%s/%s", path, dir->d_name);
 
-            // Extract time from filename to check range roughly?
-            // Filename: sname_hh:mm:ss.sssssssss.txt
-            // We only have HH:MM:SS... in filename, day is in directory.
-            // But process_file reads actual timestamps.
-
-            // If scanning keywords, we need chronologial order.
-            // scandir alphasort gives chronological order for "sname_HH:MM:SS..." files within the same day.
-
             // For keyword scanning:
-            if (kscan_ctx.target_key[0] != '\0') {
+            if (kscan_ctx.target_key_pattern[0] != '\0') {
                 int process_this = 1;
                 if (kscan_ctx.target_stream[0] != '\0' && strcmp(stream_name, kscan_ctx.target_stream) != 0) {
                     process_this = 0;
@@ -347,32 +385,17 @@ void scan_stream_dir(const char *path, const char *stream_name, double tstart, d
                 if (process_this) {
                     // Check header file
                     char headerpath[1024];
-                    // Replace .txt with .fits.header
-                    // Assuming name is sname_....txt
-                    // header is sname_....fits.header
                     strncpy(headerpath, filepath, sizeof(headerpath));
                     headerpath[strlen(filepath) - 4] = '\0'; // Remove .txt
                     strncat(headerpath, ".fits.header", sizeof(headerpath) - strlen(headerpath) - 1);
 
-                    // We need a timestamp for the file.
-                    // process_file gets individual frame times.
-                    // We can peek at the first valid time in the txt file?
-                    // Or parse the filename?
-                    // Filename only has time of day. We need full time.
-                    // But we are inside `scan_stream_dir` which is inside a day loop.
-                    // We don't have the "day" easily accessible here except via path traversal or parsing path.
-                    // Actually, process_file reads the absolute time from the file content.
-                    // Let's modify process_file to return the first timestamp?
-                    // Or just read the first line of the file manually here?
-
-                    // Let's just peek the first line of the .txt file to get the time.
+                    // Peek time
                     FILE *fp = fopen(filepath, "r");
                     if (fp) {
                         char line[1024];
                         double file_ts = 0.0;
                         while(fgets(line, sizeof(line), fp)) {
                             if (line[0] == '#') continue;
-                            // col 5
                             char *token = strtok(line, " \t");
                             int col = 0;
                             while (token) {
@@ -388,7 +411,7 @@ void scan_stream_dir(const char *path, const char *stream_name, double tstart, d
                         fclose(fp);
 
                         if (file_ts >= tstart && file_ts <= tend) {
-                            process_header_for_key(headerpath, file_ts);
+                            process_header_for_key(headerpath, stream_name, file_ts);
                         }
                     }
                 }
@@ -402,17 +425,15 @@ void scan_stream_dir(const char *path, const char *stream_name, double tstart, d
 }
 
 int main(int argc, char *argv[]) {
-    // Parse arguments
-    // Simple manual parsing since we have positional args
-    // milk-streamtelemetry-scan [-k KEY] <dir> <tstart> <tend>
-
     char *root_dir = NULL;
     char *tstart_str = NULL;
     char *tend_str = NULL;
 
-    kscan_ctx.target_key[0] = '\0';
+    kscan_ctx.target_key_pattern[0] = '\0';
     kscan_ctx.target_stream[0] = '\0';
-    kscan_ctx.has_last_value = 0;
+    kscan_ctx.tracked_keys = NULL;
+    kscan_ctx.tracked_count = 0;
+    kscan_ctx.tracked_capacity = 0;
     init_report(&kscan_ctx.report);
 
     int pos_arg_count = 0;
@@ -426,9 +447,14 @@ int main(int argc, char *argv[]) {
                 if (colon) {
                     *colon = '\0';
                     strncpy(kscan_ctx.target_stream, karg, 255);
-                    strncpy(kscan_ctx.target_key, colon + 1, 79);
+                    strncpy(kscan_ctx.target_key_pattern, colon + 1, 255);
                 } else {
-                    strncpy(kscan_ctx.target_key, karg, 79);
+                    strncpy(kscan_ctx.target_key_pattern, karg, 255);
+                }
+
+                if (regcomp(&kscan_ctx.key_regex, kscan_ctx.target_key_pattern, REG_EXTENDED | REG_NOSUB) != 0) {
+                    fprintf(stderr, "Error: Invalid regex: %s\n", kscan_ctx.target_key_pattern);
+                    return 1;
                 }
             } else {
                 fprintf(stderr, "Error: -k requires an argument\n");
@@ -526,21 +552,27 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // If we were scanning keys, we might have a final value pending
-    if (kscan_ctx.has_last_value) {
-        ReportLine count_line;
-        count_line.is_count_line = 1;
-        count_line.count = kscan_ctx.count_same_val;
-        add_report_line(&kscan_ctx.report, count_line);
+    // If we were scanning keys, we might have final values pending for multiple keys
+    for (int i = 0; i < kscan_ctx.tracked_count; i++) {
+        TrackedKey *tk = &kscan_ctx.tracked_keys[i];
+        if (tk->has_last_value) {
+            ReportLine count_line;
+            count_line.is_count_line = 1;
+            count_line.count = tk->count_same_val;
+            strncpy(count_line.keyname, tk->key, 79);
+            strncpy(count_line.stream_name, tk->stream_name, 255);
+            add_report_line(&kscan_ctx.report, count_line);
 
-        ReportLine end_line;
-        end_line.is_count_line = 0;
-        strncpy(end_line.keyname, kscan_ctx.target_key, 79);
-        end_line.ts = tend; // Use scan end time?
-        strcpy(end_line.status, "END");
-        strncpy(end_line.value, kscan_ctx.last_value, 255);
-        end_line.filename[0] = '\0'; // No file for end status
-        add_report_line(&kscan_ctx.report, end_line);
+            ReportLine end_line;
+            end_line.is_count_line = 0;
+            strncpy(end_line.stream_name, tk->stream_name, 255);
+            strncpy(end_line.keyname, tk->key, 79);
+            end_line.ts = tend; // Use scan end time
+            strcpy(end_line.status, "END");
+            strncpy(end_line.value, tk->last_value, 255);
+            end_line.filename[0] = '\0'; // No file for end status
+            add_report_line(&kscan_ctx.report, end_line);
+        }
     }
 
     // Print output
@@ -656,89 +688,85 @@ int main(int argc, char *argv[]) {
         }
         printf("\n");
 
-        // Render Keyword Timeline Row if scanning
-        if (kscan_ctx.target_key[0] != '\0') {
-            // Allocate buffer for timeline line
-            char *key_line = malloc(timeline_width + 1);
-            memset(key_line, ' ', timeline_width);
-            key_line[timeline_width] = '\0';
+        // Render Keyword Timeline Row(s) if scanning
+        if (kscan_ctx.target_key_pattern[0] != '\0') {
+            // Find all unique keys for this stream in the report
+            // Only consider unique keys that have some entries for this stream
 
-            int has_key_entries = 0;
+            for (int k = 0; k < kscan_ctx.tracked_count; k++) {
+                TrackedKey *tk = &kscan_ctx.tracked_keys[k];
+                if (strcmp(tk->stream_name, s->name) != 0) continue;
 
-            // Iterate report lines to fill key_line
-            // We assume report is sorted by time.
-            // Filter by stream name in filename
+                // Process timeline for this specific key on this stream
+                char *key_line = malloc(timeline_width + 1);
+                memset(key_line, ' ', timeline_width);
+                key_line[timeline_width] = '\0';
 
-            // First pass: Mark changes with '|'
-            for (int r = 0; r < kscan_ctx.report.count; r++) {
-                ReportLine *l = &kscan_ctx.report.lines[r];
-                if (l->is_count_line) continue;
+                int has_key_entries = 0;
 
-                // Check if filename matches stream
-                if (strncmp(l->filename, s->name, strlen(s->name)) != 0) continue;
+                // First pass: Mark changes with '|'
+                for (int r = 0; r < kscan_ctx.report.count; r++) {
+                    ReportLine *l = &kscan_ctx.report.lines[r];
+                    if (l->is_count_line) continue;
 
-                // Map time to bin
-                if (l->ts >= tstart && l->ts <= tend) {
-                    int bin = (int)((l->ts - tstart) / (tend - tstart) * timeline_width);
-                    if (bin >= 0 && bin < timeline_width) {
-                        key_line[bin] = '|';
-                        has_key_entries = 1;
-                    }
-                }
-            }
+                    if (strcmp(l->stream_name, s->name) != 0) continue;
+                    if (strcmp(l->keyname, tk->key) != 0) continue;
 
-            // Second pass: Fill values
-            // We need to know the active value at each point.
-            // This is complex because we need to know the state before tstart for this stream.
-            // Simplified approach: Iterate bins. Find last report entry <= bin_time for this stream.
-
-            if (has_key_entries) {
-                for (int b = 0; b < timeline_width; b++) {
-                    if (key_line[b] == '|') continue;
-
-                    // Calc time for middle of bin? or start?
-                    double bin_time = tstart + (b + 0.5) * dt_per_char;
-
-                    // Find last event for this stream before bin_time
-                    const char *val = NULL;
-                    for (int r = 0; r < kscan_ctx.report.count; r++) {
-                        ReportLine *l = &kscan_ctx.report.lines[r];
-                        if (l->is_count_line) continue;
-                        if (strncmp(l->filename, s->name, strlen(s->name)) != 0) continue;
-
-                        if (l->ts <= bin_time) {
-                            val = l->value;
-                        } else {
-                            break; // Passed time
+                    // Map time to bin
+                    if (l->ts >= tstart && l->ts <= tend) {
+                        int bin = (int)((l->ts - tstart) / (tend - tstart) * timeline_width);
+                        if (bin >= 0 && bin < timeline_width) {
+                            key_line[bin] = '|';
+                            has_key_entries = 1;
                         }
                     }
+                }
 
-                    // If we have a value and we are just after a pipe or start of line, print it
-                    if (val) {
-                        int prev_pipe = -1;
-                        for (int p = b - 1; p >= 0; p--) {
-                            if (key_line[p] == '|') {
-                                prev_pipe = p;
+                // Second pass: Fill values
+                if (has_key_entries) {
+                    for (int b = 0; b < timeline_width; b++) {
+                        if (key_line[b] == '|') continue;
+
+                        double bin_time = tstart + (b + 0.5) * dt_per_char;
+
+                        const char *val = NULL;
+                        for (int r = 0; r < kscan_ctx.report.count; r++) {
+                            ReportLine *l = &kscan_ctx.report.lines[r];
+                            if (l->is_count_line) continue;
+                            if (strcmp(l->stream_name, s->name) != 0) continue;
+                            if (strcmp(l->keyname, tk->key) != 0) continue;
+
+                            if (l->ts <= bin_time) {
+                                val = l->value;
+                            } else {
                                 break;
                             }
                         }
 
-                        // Distance from last pipe (or start)
-                        int dist = b - (prev_pipe == -1 ? -1 : prev_pipe);
-                        // Convert value char index: dist - 1 (1-based offset from pipe)
-                        int char_idx = dist - 1;
-                        if (char_idx >= 0 && char_idx < (int)strlen(val)) {
-                            key_line[b] = val[char_idx];
+                        if (val) {
+                            int prev_pipe = -1;
+                            for (int p = b - 1; p >= 0; p--) {
+                                if (key_line[p] == '|') {
+                                    prev_pipe = p;
+                                    break;
+                                }
+                            }
+
+                            int dist = b - (prev_pipe == -1 ? -1 : prev_pipe);
+                            int char_idx = dist - 1;
+                            if (char_idx >= 0 && char_idx < (int)strlen(val)) {
+                                key_line[b] = val[char_idx];
+                            }
                         }
                     }
+
+                    // Print the line
+                    printf("%-*s ", prefix_width, "");
+                    // Maybe print keyname too at end?
+                    printf("%s  %s\n", key_line, tk->key);
                 }
-
-                // Print the line
-                printf("%-*s ", prefix_width, "");
-                printf("%s\n", key_line);
+                free(key_line);
             }
-
-            free(key_line);
         }
     }
 
@@ -754,15 +782,6 @@ int main(int argc, char *argv[]) {
     // Print Keyword Report
     if (kscan_ctx.report.count > 0) {
         printf("\nKeyword Scan Report:\n");
-        // "Keyname, UT time, unix time, status (INITIAL, CHANGE, END) and Keyword value, all aligned."
-        // "Intermediate lines ... should start with 8 blanks chars and then print “XX files”"
-
-        // Define column widths
-        // Keyname: 20
-        // UT time: 24
-        // Unix time: 18
-        // Status: 10
-        // Value: rest
 
         for (int i = 0; i < kscan_ctx.report.count; i++) {
             ReportLine *l = &kscan_ctx.report.lines[i];
@@ -773,7 +792,6 @@ int main(int argc, char *argv[]) {
                 format_time_iso(l->ts, time_str, sizeof(time_str));
 
                 // Keyname, UT time, unix time, status, Keyword value, Filename
-                // Filename at the end
                 printf("%-20s %-24s %-18.6f %-10s %-20s %s\n",
                        l->keyname,
                        time_str,
@@ -786,6 +804,8 @@ int main(int argc, char *argv[]) {
     }
 
     free_report(&kscan_ctx.report);
+    if (kscan_ctx.tracked_keys) free(kscan_ctx.tracked_keys);
+    if (kscan_ctx.target_key_pattern[0] != '\0') regfree(&kscan_ctx.key_regex);
     free_stream_list(&stream_list);
     return 0;
 }
