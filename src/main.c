@@ -104,7 +104,7 @@ void init_stream_list(StreamList *list) {
     list->streams = malloc(list->capacity * sizeof(Stream));
 }
 
-Stream* get_or_create_stream(StreamList *list, const char *name, int num_bins) {
+Stream* get_or_create_stream(StreamList *list, const char *name) {
     for (int i = 0; i < list->count; i++) {
         if (strcmp(list->streams[i].name, name) == 0) {
             return &list->streams[i];
@@ -118,14 +118,14 @@ Stream* get_or_create_stream(StreamList *list, const char *name, int num_bins) {
     strncpy(s->name, name, 255);
     s->name[255] = '\0';
     s->total_frames = 0;
-    s->bins = calloc(num_bins, sizeof(int));
+    s->bins = NULL;
     s->max_bin_count = 0;
     return s;
 }
 
 void free_stream_list(StreamList *list) {
     for (int i = 0; i < list->count; i++) {
-        free(list->streams[i].bins);
+        if (list->streams[i].bins) free(list->streams[i].bins);
     }
     free(list->streams);
 }
@@ -138,7 +138,6 @@ int is_directory(const char *path) {
 
 double parse_time_arg(const char *arg) {
     if (strncmp(arg, "UT", 2) == 0) {
-        // Parse UTYYYYMMDDTHH:MM:SS
         struct tm tm_val;
         memset(&tm_val, 0, sizeof(struct tm));
         int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
@@ -170,77 +169,47 @@ void format_time_iso(double ts, char *buf, size_t size) {
              tm_val.tm_hour, tm_val.tm_min, tm_val.tm_sec);
 }
 
-// Function to process a single .txt file
-void process_file(const char *filepath, const char *stream_name, double tstart, double tend, StreamList *streams, int num_bins) {
-    FILE *fp = fopen(filepath, "r");
-    if (!fp) return;
-
-    char line[1024];
-    Stream *s = NULL;
-
-    // Optimization: Only lookup stream once we find valid frames or just once per file?
-    // Once per file is safer.
-    s = get_or_create_stream(streams, stream_name, num_bins);
-
-    while (fgets(line, sizeof(line), fp)) {
-        if (line[0] == '#') continue;
-
-        // Parse columns. We need column 5 (0-indexed 4).
-        // Format is space separated.
-        char *ptr = line;
-        int col = 0;
-        double timestamp = 0.0;
-        int found = 0;
-
-        // Simple tokenizer
-        char *token = strtok(line, " \t");
-        while (token) {
-            if (col == 4) { // 5th column
-                timestamp = atof(token);
-                found = 1;
-                break;
-            }
-            token = strtok(NULL, " \t");
-            col++;
-        }
-
-        if (found) {
-            if (timestamp >= tstart && timestamp <= tend) {
-                s->total_frames++;
-                int bin = (int)((timestamp - tstart) / (tend - tstart) * num_bins);
-                if (bin < 0) bin = 0;
-                if (bin >= num_bins) bin = num_bins - 1;
-                s->bins[bin]++;
-                if (s->bins[bin] > s->max_bin_count) {
-                    s->max_bin_count = s->bins[bin];
-                }
-            }
-        }
-    }
-    fclose(fp);
-}
-
 void trim_fits_value(char *val) {
-    // Remove leading spaces
     char *start = val;
     while (*start == ' ') start++;
-
-    // Remove trailing spaces
     char *end = start + strlen(start) - 1;
     while (end > start && (*end == ' ' || *end == '\n' || *end == '\r')) end--;
     *(end + 1) = '\0';
-
-    // Remove quotes if string
     if (*start == '\'' && *end == '\'') {
         start++;
         *end = '\0';
-        // Check for trailing quote spaces?
+        // Remove leading spaces inside quotes
+        while (*start == ' ') start++;
+        // Remove trailing spaces inside quotes
         char *new_end = start + strlen(start) - 1;
         while (new_end > start && *new_end == ' ') new_end--;
         *(new_end+1) = '\0';
     }
-
     memmove(val, start, strlen(start) + 1);
+}
+
+int read_header_keyword(const char *filepath, const char *key, char *value_out) {
+    FILE *fp = fopen(filepath, "r");
+    if (!fp) return 0;
+
+    char line[82];
+    int found = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, key, strlen(key)) == 0) {
+            char *eq_pos = strchr(line, '=');
+            if (eq_pos) {
+                char *slash_pos = strchr(eq_pos, '/');
+                if (slash_pos) *slash_pos = '\0';
+                strncpy(value_out, eq_pos + 1, 255);
+                value_out[255] = '\0';
+                trim_fits_value(value_out);
+                found = 1;
+                break;
+            }
+        }
+    }
+    fclose(fp);
+    return found;
 }
 
 // Global context for keyword scanning
@@ -271,14 +240,10 @@ void process_header_for_key(const char *header_path, const char *stream_name, do
     FILE *fp = fopen(header_path, "r");
     if (!fp) return;
 
-    char line[82]; // FITS header lines are 80 chars
-
+    char line[82];
     while (fgets(line, sizeof(line), fp)) {
-        // Parse key: chars before '=' or first 8 chars
-        // FITS: "KEYNAME = value"
         char key[81];
         char value[256];
-        int has_eq = 0;
         char *eq_pos = strchr(line, '=');
 
         if (eq_pos) {
@@ -287,24 +252,17 @@ void process_header_for_key(const char *header_path, const char *stream_name, do
             strncpy(key, line, key_len);
             key[key_len] = '\0';
 
-            // Trim key
             char *end = key + strlen(key) - 1;
             while (end >= key && (*end == ' ' || *end == '\t')) *end-- = '\0';
 
-            // Regex check
             if (regexec(&kscan_ctx.key_regex, key, 0, NULL, 0) == 0) {
-                // Extract value
                 char *slash_pos = strchr(eq_pos, '/');
-                if (slash_pos) *slash_pos = '\0'; // Remove comment
-
+                if (slash_pos) *slash_pos = '\0';
                 strncpy(value, eq_pos + 1, 255);
                 value[255] = '\0';
                 trim_fits_value(value);
 
-                // Track state
                 TrackedKey *tk = get_tracked_key(stream_name, key);
-
-                // Extract basename
                 const char *base = strrchr(header_path, '/');
                 if (base) base++; else base = header_path;
 
@@ -324,19 +282,13 @@ void process_header_for_key(const char *header_path, const char *stream_name, do
                     tk->has_last_value = 1;
                 } else {
                     if (strcmp(value, tk->last_value) != 0) {
-                        // Add count line
                         ReportLine count_line;
                         count_line.is_count_line = 1;
                         count_line.count = tk->count_same_val;
-                        // Count line needs keyname to associate?
-                        // The print logic assumes sequential.
-                        // But with multiple keys/streams, sequential might be mixed.
-                        // We store keyname in count line too just in case.
                         strncpy(count_line.keyname, key, 79);
                         strncpy(count_line.stream_name, stream_name, 255);
                         add_report_line(&kscan_ctx.report, count_line);
 
-                        // Add change line
                         ReportLine change_line;
                         change_line.is_count_line = 0;
                         strncpy(change_line.stream_name, stream_name, 255);
@@ -359,7 +311,8 @@ void process_header_for_key(const char *header_path, const char *stream_name, do
     fclose(fp);
 }
 
-void scan_stream_dir(const char *path, const char *stream_name, double tstart, double tend, StreamList *streams, int num_bins) {
+// pass 0 = count frames only, pass 1 = binning and headers
+void scan_stream_dir(const char *path, const char *stream_name, double tstart, double tend, StreamList *streams, int num_bins, int pass) {
     struct dirent **namelist;
     int n = scandir(path, &namelist, NULL, alphasort);
     if (n < 0) return;
@@ -371,59 +324,150 @@ void scan_stream_dir(const char *path, const char *stream_name, double tstart, d
             continue;
         }
 
-        // Check if it ends with .txt
         size_t len = strlen(dir->d_name);
         if (len > 4 && strcmp(dir->d_name + len - 4, ".txt") == 0) {
             char filepath[1024];
             snprintf(filepath, sizeof(filepath), "%s/%s", path, dir->d_name);
 
-            // For keyword scanning:
-            if (kscan_ctx.target_key_pattern[0] != '\0') {
-                int process_this = 1;
-                if (kscan_ctx.target_stream[0] != '\0' && strcmp(stream_name, kscan_ctx.target_stream) != 0) {
-                    process_this = 0;
-                }
-
-                if (process_this) {
-                    // Check header file
-                    char headerpath[1024];
-                    strncpy(headerpath, filepath, sizeof(headerpath));
-                    headerpath[strlen(filepath) - 4] = '\0'; // Remove .txt
-                    strncat(headerpath, ".fits.header", sizeof(headerpath) - strlen(headerpath) - 1);
-
-                    // Peek time
-                    FILE *fp = fopen(filepath, "r");
-                    if (fp) {
-                        char line[1024];
-                        double file_ts = 0.0;
-                        while(fgets(line, sizeof(line), fp)) {
-                            if (line[0] == '#') continue;
-                            char *token = strtok(line, " \t");
-                            int col = 0;
-                            while (token) {
-                                if (col == 4) {
-                                    file_ts = atof(token);
-                                    break;
-                                }
-                                token = strtok(NULL, " \t");
-                                col++;
-                            }
-                            if (file_ts > 0) break;
+            if (pass == 0) {
+                // Pass 0: Count frames
+                FILE *fp = fopen(filepath, "r");
+                if (fp) {
+                    Stream *s = get_or_create_stream(streams, stream_name);
+                    char line[1024];
+                    while (fgets(line, sizeof(line), fp)) {
+                        if (line[0] == '#') continue;
+                        char *token = strtok(line, " \t");
+                        int col = 0;
+                        double timestamp = 0.0;
+                        int found = 0;
+                        while (token) {
+                            if (col == 4) { timestamp = atof(token); found = 1; break; }
+                            token = strtok(NULL, " \t");
+                            col++;
                         }
-                        fclose(fp);
+                        if (found && timestamp >= tstart && timestamp <= tend) {
+                            s->total_frames++;
+                        }
+                    }
+                    fclose(fp);
+                }
+            } else if (pass == 1) {
+                // Pass 1: Binning and Headers
 
-                        if (file_ts >= tstart && file_ts <= tend) {
-                            process_header_for_key(headerpath, stream_name, file_ts);
+                // Header Scan
+                if (kscan_ctx.target_key_pattern[0] != '\0') {
+                    int process_this = 1;
+                    if (kscan_ctx.target_stream[0] != '\0' && strcmp(stream_name, kscan_ctx.target_stream) != 0) {
+                        process_this = 0;
+                    }
+                    if (process_this) {
+                        char headerpath[1024];
+                        strncpy(headerpath, filepath, sizeof(headerpath));
+                        headerpath[strlen(filepath) - 4] = '\0';
+                        strncat(headerpath, ".fits.header", sizeof(headerpath) - strlen(headerpath) - 1);
+
+                        FILE *fp = fopen(filepath, "r");
+                        if (fp) {
+                            char line[1024];
+                            double file_ts = 0.0;
+                            while(fgets(line, sizeof(line), fp)) {
+                                if (line[0] == '#') continue;
+                                char *token = strtok(line, " \t");
+                                int col = 0;
+                                while (token) {
+                                    if (col == 4) { file_ts = atof(token); break; }
+                                    token = strtok(NULL, " \t");
+                                    col++;
+                                }
+                                if (file_ts > 0) break;
+                            }
+                            fclose(fp);
+                            if (file_ts >= tstart && file_ts <= tend) {
+                                process_header_for_key(headerpath, stream_name, file_ts);
+                            }
                         }
                     }
                 }
-            }
 
-            process_file(filepath, stream_name, tstart, tend, streams, num_bins);
+                // Binning
+                FILE *fp = fopen(filepath, "r");
+                if (fp) {
+                    Stream *s = get_or_create_stream(streams, stream_name);
+                    char line[1024];
+                    while (fgets(line, sizeof(line), fp)) {
+                        if (line[0] == '#') continue;
+                        char *token = strtok(line, " \t");
+                        int col = 0;
+                        double timestamp = 0.0;
+                        int found = 0;
+                        while (token) {
+                            if (col == 4) { timestamp = atof(token); found = 1; break; }
+                            token = strtok(NULL, " \t");
+                            col++;
+                        }
+                        if (found && timestamp >= tstart && timestamp <= tend) {
+                            int bin = (int)((timestamp - tstart) / (tend - tstart) * num_bins);
+                            if (bin < 0) bin = 0;
+                            if (bin >= num_bins) bin = num_bins - 1;
+                            s->bins[bin]++;
+                            if (s->bins[bin] > s->max_bin_count) {
+                                s->max_bin_count = s->bins[bin];
+                            }
+                        }
+                    }
+                    fclose(fp);
+                }
+            }
         }
         free(namelist[i]);
     }
     free(namelist);
+}
+
+void process_all_dates(const char *root_dir, double tstart, double tend, StreamList *stream_list, int timeline_width, int pass) {
+    time_t current_t = (time_t)tstart;
+    time_t end_t = (time_t)tend;
+
+    struct tm start_tm_struct;
+    gmtime_r(&current_t, &start_tm_struct);
+    start_tm_struct.tm_hour = 0; start_tm_struct.tm_min = 0; start_tm_struct.tm_sec = 0;
+    time_t iter_t = timegm(&start_tm_struct);
+
+    struct tm end_tm_struct;
+    gmtime_r(&end_t, &end_tm_struct);
+    end_tm_struct.tm_hour = 0; end_tm_struct.tm_min = 0; end_tm_struct.tm_sec = 0;
+    time_t end_iter_t = timegm(&end_tm_struct);
+
+    for (time_t t = iter_t; t <= end_iter_t + 10; t += 86400) {
+        if (t > end_iter_t) break;
+        struct tm tm_date;
+        gmtime_r(&t, &tm_date);
+        char date_str[32];
+        snprintf(date_str, sizeof(date_str), "%04d%02d%02d",
+                 tm_date.tm_year + 1900, tm_date.tm_mon + 1, tm_date.tm_mday);
+
+        char date_path[1024];
+        snprintf(date_path, sizeof(date_path), "%s/%s", root_dir, date_str);
+
+        if (is_directory(date_path)) {
+            struct dirent **streamlist;
+            int n_stream = scandir(date_path, &streamlist, NULL, alphasort);
+            if (n_stream >= 0) {
+                for (int i = 0; i < n_stream; i++) {
+                    struct dirent *dir = streamlist[i];
+                    if (dir->d_name[0] == '.') { free(streamlist[i]); continue; }
+                    char stream_path[2048];
+                    snprintf(stream_path, sizeof(stream_path), "%s/%s", date_path, dir->d_name);
+                    if (is_directory(stream_path)) {
+                        scan_stream_dir(stream_path, dir->d_name, tstart, tend, stream_list, timeline_width, pass);
+                    }
+                    free(streamlist[i]);
+                }
+                free(streamlist);
+            }
+        }
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -439,12 +483,10 @@ int main(int argc, char *argv[]) {
     init_report(&kscan_ctx.report);
 
     int pos_arg_count = 0;
-
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-k") == 0) {
             if (i + 1 < argc) {
                 char *karg = argv[++i];
-                // Check if sname:keyname
                 char *colon = strchr(karg, ':');
                 if (colon) {
                     *colon = '\0';
@@ -453,7 +495,6 @@ int main(int argc, char *argv[]) {
                 } else {
                     strncpy(kscan_ctx.target_key_pattern, karg, 255);
                 }
-
                 if (regcomp(&kscan_ctx.key_regex, kscan_ctx.target_key_pattern, REG_EXTENDED | REG_NOSUB) != 0) {
                     fprintf(stderr, "Error: Invalid regex: %s\n", kscan_ctx.target_key_pattern);
                     return 1;
@@ -490,71 +531,41 @@ int main(int argc, char *argv[]) {
         term_width = w.ws_col;
     }
 
-    int name_width = 20;
-    int timeline_width = term_width - name_width - 2; // -2 for spacing
-    if (timeline_width < 10) timeline_width = 10;
-
     StreamList stream_list;
     init_stream_list(&stream_list);
 
-    // Iterate through dates from tstart to tend
-    time_t current_t = (time_t)tstart;
-    time_t end_t = (time_t)tend;
+    // Pass 1: Discovery and counts
+    process_all_dates(root_dir, tstart, tend, &stream_list, 0, 0);
 
-    struct tm start_tm_struct;
-    gmtime_r(&current_t, &start_tm_struct);
+    // Calculate formatting
+    int max_name_len = 10;
+    int max_count_len = 5;
+    for (int i = 0; i < stream_list.count; i++) {
+        Stream *s = &stream_list.streams[i];
+        if (s->total_frames == 0) continue;
+        int len = strlen(s->name);
+        if (len > max_name_len) max_name_len = len;
 
-    start_tm_struct.tm_hour = 0;
-    start_tm_struct.tm_min = 0;
-    start_tm_struct.tm_sec = 0;
-    time_t iter_t = timegm(&start_tm_struct);
-
-    struct tm end_tm_struct;
-    gmtime_r(&end_t, &end_tm_struct);
-    end_tm_struct.tm_hour = 0;
-    end_tm_struct.tm_min = 0;
-    end_tm_struct.tm_sec = 0;
-    time_t end_iter_t = timegm(&end_tm_struct);
-
-    // Loop through days
-    for (time_t t = iter_t; t <= end_iter_t + 10; t += 86400) {
-        if (t > end_iter_t) break;
-
-        struct tm tm_date;
-        gmtime_r(&t, &tm_date);
-        char date_str[32];
-        snprintf(date_str, sizeof(date_str), "%04d%02d%02d",
-                 tm_date.tm_year + 1900, tm_date.tm_mon + 1, tm_date.tm_mday);
-
-        char date_path[1024];
-        snprintf(date_path, sizeof(date_path), "%s/%s", root_dir, date_str);
-
-        if (is_directory(date_path)) {
-            // Scan subdirectories (streams) - Sorted to ensure deterministic order (apapane, then ocam2d)
-            struct dirent **streamlist;
-            int n_stream = scandir(date_path, &streamlist, NULL, alphasort);
-            if (n_stream >= 0) {
-                for (int i = 0; i < n_stream; i++) {
-                    struct dirent *dir = streamlist[i];
-                    if (dir->d_name[0] == '.') {
-                        free(streamlist[i]);
-                        continue;
-                    }
-
-                    char stream_path[2048];
-                    snprintf(stream_path, sizeof(stream_path), "%s/%s", date_path, dir->d_name);
-
-                    if (is_directory(stream_path)) {
-                        scan_stream_dir(stream_path, dir->d_name, tstart, tend, &stream_list, timeline_width);
-                    }
-                    free(streamlist[i]);
-                }
-                free(streamlist);
-            }
-        }
+        char count_buf[32];
+        int clen = snprintf(count_buf, sizeof(count_buf), "%ld", s->total_frames);
+        if (clen > max_count_len) max_count_len = clen;
     }
 
-    // If we were scanning keys, we might have final values pending for multiple keys
+    // Name(max) + "   " + Count(max) + "   " + " 123.4 Hz "
+    int prefix_width = max_name_len + 3 + max_count_len + 3 + 10 + 1;
+
+    int timeline_width = term_width - prefix_width - 1;
+    if (timeline_width < 10) timeline_width = 10;
+
+    // Allocate bins
+    for (int i = 0; i < stream_list.count; i++) {
+        stream_list.streams[i].bins = calloc(timeline_width, sizeof(int));
+    }
+
+    // Pass 2: Data processing
+    process_all_dates(root_dir, tstart, tend, &stream_list, timeline_width, 1);
+
+    // Handle end of keyword tracking
     for (int i = 0; i < kscan_ctx.tracked_count; i++) {
         TrackedKey *tk = &kscan_ctx.tracked_keys[i];
         if (tk->has_last_value) {
@@ -569,15 +580,15 @@ int main(int argc, char *argv[]) {
             end_line.is_count_line = 0;
             strncpy(end_line.stream_name, tk->stream_name, 255);
             strncpy(end_line.keyname, tk->key, 79);
-            end_line.ts = tend; // Use scan end time
+            end_line.ts = tend;
             strcpy(end_line.status, "END");
             strncpy(end_line.value, tk->last_value, 255);
-            end_line.filename[0] = '\0'; // No file for end status
+            end_line.filename[0] = '\0';
             add_report_line(&kscan_ctx.report, end_line);
         }
     }
 
-    // Print output
+    // Output
     char start_str[64];
     char end_str[64];
     format_time_iso(tstart, start_str, sizeof(start_str));
@@ -588,34 +599,6 @@ int main(int argc, char *argv[]) {
 
     printf("\nStart: %s  End: %s  Duration: %.3f s  Bin: %.3f s\n\n",
            start_str, end_str, duration, dt_per_char);
-
-    // Calculate max label widths for alignment
-    int max_name_len = 10;
-    int max_count_len = 5;
-    for (int i = 0; i < stream_list.count; i++) {
-        Stream *s = &stream_list.streams[i];
-        if (s->total_frames == 0) continue;
-        int len = strlen(s->name);
-        if (len > max_name_len) max_name_len = len;
-
-        char count_buf[32];
-        int clen = snprintf(count_buf, sizeof(count_buf), "%ld", s->total_frames);
-        if (clen > max_count_len) max_count_len = clen;
-    }
-
-    // Total prefix width: Name + space + [ + Count + ] + space + FPS + space
-    // StreamName [Count] 1234.5 Hz
-    // Actual requested order: Stream name, number of frames, framerate, then framerate characters.
-    // "stream name, then number of frames, then framerate, then framerate characters"
-    // Let's format: "NAME   12345   123.4 Hz "
-
-    int prefix_width = max_name_len + 3 + max_count_len + 3 + 10 + 1;
-    // Name(max) + "   " + Count(max) + "   " + " 123.4 Hz "
-
-    // Adjust timeline width: ensure we don't wrap. prefix_width + timeline_width <= term_width
-    // We print prefix_width chars then a space, so prefix_width + 1 + timeline_width <= term_width
-    timeline_width = term_width - prefix_width - 1;
-    if (timeline_width < 10) timeline_width = 10;
 
     // Print Header
     printf("%-*s ", prefix_width, "");
@@ -687,38 +670,31 @@ int main(int argc, char *argv[]) {
                     idx = 1;
                 }
             }
-            // Print with color
             if (idx > 0) printf("%s", COLORS[idx]);
             printf("%s", BLOCKS[idx]);
             if (idx > 0) printf(RESET_COLOR);
         }
         printf("\n");
 
-        // Render Keyword Timeline Row(s) if scanning
+        // Render Keyword Timeline Row(s)
         if (kscan_ctx.target_key_pattern[0] != '\0') {
-            // Find all unique keys for this stream in the report
-            // Only consider unique keys that have some entries for this stream
-
             for (int k = 0; k < kscan_ctx.tracked_count; k++) {
                 TrackedKey *tk = &kscan_ctx.tracked_keys[k];
                 if (strcmp(tk->stream_name, s->name) != 0) continue;
 
-                // Process timeline for this specific key on this stream
                 char *key_line = malloc(timeline_width + 1);
                 memset(key_line, ' ', timeline_width);
                 key_line[timeline_width] = '\0';
 
                 int has_key_entries = 0;
 
-                // First pass: Mark changes with '|'
+                // Pass 1: Pipes
                 for (int r = 0; r < kscan_ctx.report.count; r++) {
                     ReportLine *l = &kscan_ctx.report.lines[r];
                     if (l->is_count_line) continue;
-
                     if (strcmp(l->stream_name, s->name) != 0) continue;
                     if (strcmp(l->keyname, tk->key) != 0) continue;
 
-                    // Map time to bin
                     if (l->ts >= tstart && l->ts <= tend) {
                         int bin = (int)((l->ts - tstart) / (tend - tstart) * timeline_width);
                         if (bin >= 0 && bin < timeline_width) {
@@ -728,7 +704,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                // Second pass: Fill values
+                // Pass 2: Values
                 if (has_key_entries) {
                     for (int b = 0; b < timeline_width; b++) {
                         if (key_line[b] == '|') continue;
@@ -757,7 +733,6 @@ int main(int argc, char *argv[]) {
                                     break;
                                 }
                             }
-
                             int dist = b - (prev_pipe == -1 ? -1 : prev_pipe);
                             int char_idx = dist - 1;
                             if (char_idx >= 0 && char_idx < (int)strlen(val)) {
@@ -765,9 +740,6 @@ int main(int argc, char *argv[]) {
                             }
                         }
                     }
-
-                    // Print the line
-                    // Print keyname in the prefix area, right aligned
                     printf("%*s ", prefix_width, tk->key);
                     printf("%s\n", key_line);
                 }
@@ -785,10 +757,8 @@ int main(int argc, char *argv[]) {
     }
     printf(" (Low -> High density)\n");
 
-    // Print Keyword Report
     if (kscan_ctx.report.count > 0) {
         printf("\nKeyword Scan Report:\n");
-
         for (int i = 0; i < kscan_ctx.report.count; i++) {
             ReportLine *l = &kscan_ctx.report.lines[i];
             if (l->is_count_line) {
@@ -796,15 +766,8 @@ int main(int argc, char *argv[]) {
             } else {
                 char time_str[64];
                 format_time_iso(l->ts, time_str, sizeof(time_str));
-
-                // Keyname, UT time, unix time, status, Keyword value, Filename
                 printf("%-20s %-24s %-18.6f %-10s %-20s %s\n",
-                       l->keyname,
-                       time_str,
-                       l->ts,
-                       l->status,
-                       l->value,
-                       l->filename);
+                       l->keyname, time_str, l->ts, l->status, l->value, l->filename);
             }
         }
     }
