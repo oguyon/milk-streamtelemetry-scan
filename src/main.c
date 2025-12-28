@@ -558,6 +558,16 @@ int main(int argc, char *argv[]) {
 
     printf("\nTimeline:\n");
 
+    // Calculate max label width for alignment
+    name_width = 20; // reset/ensure minimum
+    for (int i = 0; i < stream_list.count; i++) {
+        Stream *s = &stream_list.streams[i];
+        if (s->total_frames == 0) continue;
+        char temp_buf[256];
+        int len = snprintf(temp_buf, sizeof(temp_buf), "[%ld] %s", s->total_frames, s->name);
+        if (len > name_width) name_width = len;
+    }
+
     // Print Header
     printf("%-*s ", name_width, "");
 
@@ -619,7 +629,12 @@ int main(int argc, char *argv[]) {
             printf("%s", BLOCKS[idx]);
             if (idx > 0) printf(RESET_COLOR);
         }
-        printf("\n");
+
+        double max_fps = 0.0;
+        if (dt_per_char > 0.0) {
+            max_fps = (double)s->max_bin_count / dt_per_char;
+        }
+        printf(" %6.1f Hz\n", max_fps);
     }
 
     printf("\nLegend: ' ' = 0 frames. Blocks show relative density (normalized to peak frame rate per stream).\n");
