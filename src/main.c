@@ -26,6 +26,8 @@ const char *COLORS[] = {
 };
 #define RESET_COLOR "\033[0m"
 #define BOLD_COLOR "\033[1m"
+#define BG_HIGHLIGHT_H "\033[41m" // Red background
+#define BG_HIGHLIGHT_M "\033[44m" // Blue background
 
 typedef struct {
     char name[256];
@@ -650,7 +652,14 @@ int main(int argc, char *argv[]) {
                 if (show_s) marker = 'S';
             }
         }
-        putchar(marker);
+
+        if (marker == 'H') {
+            printf(BG_HIGHLIGHT_H "%c" RESET_COLOR, marker);
+        } else if (marker == 'M') {
+            printf(BG_HIGHLIGHT_M "%c" RESET_COLOR, marker);
+        } else {
+            putchar(marker);
+        }
     }
     printf("\n");
 
