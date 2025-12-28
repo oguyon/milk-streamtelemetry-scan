@@ -614,8 +614,9 @@ int main(int argc, char *argv[]) {
     int prefix_width = max_name_len + 3 + max_count_len + 3 + 10 + 1;
     // Name(max) + "   " + Count(max) + "   " + " 123.4 Hz "
 
-    // Adjust timeline width
-    timeline_width = term_width - prefix_width;
+    // Adjust timeline width: ensure we don't wrap. prefix_width + timeline_width <= term_width
+    // We print prefix_width chars then a space, so prefix_width + 1 + timeline_width <= term_width
+    timeline_width = term_width - prefix_width - 1;
     if (timeline_width < 10) timeline_width = 10;
 
     // Print Header
@@ -761,9 +762,9 @@ int main(int argc, char *argv[]) {
                     }
 
                     // Print the line
-                    printf("%-*s ", prefix_width, "");
-                    // Maybe print keyname too at end?
-                    printf("%s  %s\n", key_line, tk->key);
+                    // Print keyname in the prefix area, right aligned
+                    printf("%*s ", prefix_width, tk->key);
+                    printf("%s\n", key_line);
                 }
                 free(key_line);
             }
