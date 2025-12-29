@@ -312,7 +312,7 @@ void process_header_for_key(const char *header_path, const char *stream_name, do
 }
 
 // pass 0 = count frames only, pass 1 = binning and headers
-void scan_stream_dir(const char *path, const char *stream_name, double tstart, double tend, StreamList *streams, int num_bins, int pass) {
+void scan_stream_dir(const char *path, const char *stream_name, double tstart, double tend, StreamList *streams, int num_bins, int pass, long *file_count) {
     struct dirent **namelist;
     int n = scandir(path, &namelist, NULL, alphasort);
     if (n < 0) return;
@@ -326,6 +326,10 @@ void scan_stream_dir(const char *path, const char *stream_name, double tstart, d
 
         size_t len = strlen(dir->d_name);
         if (len > 4 && strcmp(dir->d_name + len - 4, ".txt") == 0) {
+            if (pass == 0 && file_count) {
+                (*file_count)++;
+            }
+
             char filepath[1024];
             snprintf(filepath, sizeof(filepath), "%s/%s", path, dir->d_name);
 
@@ -425,7 +429,7 @@ void scan_stream_dir(const char *path, const char *stream_name, double tstart, d
     free(namelist);
 }
 
-void process_all_dates(const char *root_dir, double tstart, double tend, StreamList *stream_list, int timeline_width, int pass) {
+void process_all_dates(const char *root_dir, double tstart, double tend, StreamList *stream_list, int timeline_width, int pass, long *file_count) {
     time_t current_t = (time_t)tstart;
     time_t end_t = (time_t)tend;
 
@@ -460,7 +464,7 @@ void process_all_dates(const char *root_dir, double tstart, double tend, StreamL
                     char stream_path[2048];
                     snprintf(stream_path, sizeof(stream_path), "%s/%s", date_path, dir->d_name);
                     if (is_directory(stream_path)) {
-                        scan_stream_dir(stream_path, dir->d_name, tstart, tend, stream_list, timeline_width, pass);
+                        scan_stream_dir(stream_path, dir->d_name, tstart, tend, stream_list, timeline_width, pass, file_count);
                     }
                     free(streamlist[i]);
                 }
@@ -534,8 +538,9 @@ int main(int argc, char *argv[]) {
     StreamList stream_list;
     init_stream_list(&stream_list);
 
+    long file_count = 0;
     // Pass 1: Discovery and counts
-    process_all_dates(root_dir, tstart, tend, &stream_list, 0, 0);
+    process_all_dates(root_dir, tstart, tend, &stream_list, 0, 0, &file_count);
 
     // Calculate formatting
     int max_name_len = 10;
@@ -563,7 +568,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Pass 2: Data processing
-    process_all_dates(root_dir, tstart, tend, &stream_list, timeline_width, 1);
+    process_all_dates(root_dir, tstart, tend, &stream_list, timeline_width, 1, NULL);
 
     // Handle end of keyword tracking
     for (int i = 0; i < kscan_ctx.tracked_count; i++) {
@@ -597,8 +602,8 @@ int main(int argc, char *argv[]) {
     double dt_per_char = (tend - tstart) / timeline_width;
     double duration = tend - tstart;
 
-    printf("\nStart: %s  End: %s  Duration: %.3f s  Bin: %.3f s\n\n",
-           start_str, end_str, duration, dt_per_char);
+    printf("\nStart: %s  End: %s  Duration: %.3f s  Bin: %.3f s  Files: %ld\n\n",
+           start_str, end_str, duration, dt_per_char, file_count);
 
     // Print Header
     printf("%-*s ", prefix_width, "");
