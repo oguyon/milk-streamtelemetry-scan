@@ -28,6 +28,7 @@ const char *COLORS[] = {
 #define BOLD_COLOR "\033[1m"
 #define BG_HIGHLIGHT_H "\033[41m" // Red background
 #define BG_HIGHLIGHT_M "\033[44m" // Blue background
+#define BG_SCALE "\033[48;5;237m" // Dark Grey background
 
 typedef struct {
     char name[256];
@@ -686,9 +687,10 @@ int main(int argc, char *argv[]) {
                     idx = 1;
                 }
             }
+            printf("%s", BG_SCALE);
             if (idx > 0) printf("%s", COLORS[idx]);
             printf("%s", BLOCKS[idx]);
-            if (idx > 0) printf(RESET_COLOR);
+            printf(RESET_COLOR);
         }
         printf("\n");
 
@@ -767,9 +769,10 @@ int main(int argc, char *argv[]) {
     printf("\nLegend: ' ' = 0 frames. Blocks show relative density (normalized to peak frame rate per stream).\n");
     printf("Scale: ");
     for (int i = 0; i < 9; i++) {
+        printf("%s", BG_SCALE);
         if (i > 0) printf("%s", COLORS[i]);
         printf("%s", BLOCKS[i]);
-        if (i > 0) printf(RESET_COLOR);
+        printf(RESET_COLOR);
     }
     printf(" (Low -> High density)\n");
 
