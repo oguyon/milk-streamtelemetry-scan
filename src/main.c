@@ -11,7 +11,7 @@
 #include <sys/ioctl.h>
 
 // Unicode Block Elements
-const char *BLOCKS[] = {" ", "\u2581", "\u2582", "\u2583", "\u2584", "\u2585", "\u2586", "\u2587", "\u2588"};
+const char *BLOCKS[] = {" ", "\u2588", "\u2588", "\u2588", "\u2588", "\u2588", "\u2588", "\u2588", "\u2588"};
 // ANSI Colors (Blue -> Cyan -> Green -> Yellow -> Red)
 const char *COLORS[] = {
     "\033[0m",        // 0: Reset (Space)
