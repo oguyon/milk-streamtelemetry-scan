@@ -98,6 +98,14 @@ void free_report(Report *r) {
     free(r->lines);
 }
 
+int compare_report_lines(const void *a, const void *b) {
+    const ReportLine *ra = (const ReportLine *)a;
+    const ReportLine *rb = (const ReportLine *)b;
+    if (ra->ts < rb->ts) return -1;
+    if (ra->ts > rb->ts) return 1;
+    return rb->is_count_line - ra->is_count_line;
+}
+
 void init_stream_list(StreamList *list) {
     list->count = 0;
     list->capacity = 10;
@@ -285,6 +293,7 @@ void process_header_for_key(const char *header_path, const char *stream_name, do
                         ReportLine count_line;
                         count_line.is_count_line = 1;
                         count_line.count = tk->count_same_val;
+                        count_line.ts = file_timestamp;
                         strncpy(count_line.keyname, key, 79);
                         strncpy(count_line.stream_name, stream_name, 255);
                         add_report_line(&kscan_ctx.report, count_line);
@@ -578,6 +587,7 @@ int main(int argc, char *argv[]) {
             ReportLine count_line;
             count_line.is_count_line = 1;
             count_line.count = tk->count_same_val;
+            count_line.ts = tend;
             strncpy(count_line.keyname, tk->key, 79);
             strncpy(count_line.stream_name, tk->stream_name, 255);
             add_report_line(&kscan_ctx.report, count_line);
@@ -765,6 +775,7 @@ int main(int argc, char *argv[]) {
 
     if (kscan_ctx.report.count > 0) {
         printf("\nKeyword Scan Report:\n");
+        qsort(kscan_ctx.report.lines, kscan_ctx.report.count, sizeof(ReportLine), compare_report_lines);
         for (int i = 0; i < kscan_ctx.report.count; i++) {
             ReportLine *l = &kscan_ctx.report.lines[i];
             if (l->is_count_line) {
