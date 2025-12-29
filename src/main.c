@@ -29,6 +29,7 @@ const char *COLORS[] = {
 #define BG_HIGHLIGHT_H "\033[41m" // Red background
 #define BG_HIGHLIGHT_M "\033[44m" // Blue background
 #define BG_SCALE "\033[48;5;237m" // Dark Grey background
+#define BG_BLACK "\033[40m"       // Black background
 
 typedef struct {
     char name[256];
@@ -440,6 +441,68 @@ void scan_stream_dir(const char *path, const char *stream_name, double tstart, d
     free(namelist);
 }
 
+void get_date_bounds(const char *root_dir, const char *date_str, double *t_min, double *t_max) {
+    char date_path[1024];
+    snprintf(date_path, sizeof(date_path), "%s/%s", root_dir, date_str);
+
+    *t_min = -1.0;
+    *t_max = -1.0;
+
+    if (!is_directory(date_path)) return;
+
+    struct dirent **streamlist;
+    int n_stream = scandir(date_path, &streamlist, NULL, alphasort);
+    if (n_stream < 0) return;
+
+    for (int i = 0; i < n_stream; i++) {
+        struct dirent *dir = streamlist[i];
+        if (dir->d_name[0] == '.') { free(streamlist[i]); continue; }
+
+        char stream_path[2048];
+        snprintf(stream_path, sizeof(stream_path), "%s/%s", date_path, dir->d_name);
+
+        if (is_directory(stream_path)) {
+            struct dirent **filelist;
+            int n_files = scandir(stream_path, &filelist, NULL, alphasort);
+            if (n_files >= 0) {
+                for (int j = 0; j < n_files; j++) {
+                    struct dirent *fdir = filelist[j];
+                    size_t len = strlen(fdir->d_name);
+                    if (len > 4 && strcmp(fdir->d_name + len - 4, ".txt") == 0) {
+                        char filepath[2048];
+                        snprintf(filepath, sizeof(filepath), "%s/%s", stream_path, fdir->d_name);
+                        FILE *fp = fopen(filepath, "r");
+                        if (fp) {
+                            char line[1024];
+                            while (fgets(line, sizeof(line), fp)) {
+                                if (line[0] == '#') continue;
+                                char *token = strtok(line, " \t");
+                                int col = 0;
+                                double ts = 0.0;
+                                int found = 0;
+                                while (token) {
+                                    if (col == 4) { ts = atof(token); found = 1; break; }
+                                    token = strtok(NULL, " \t");
+                                    col++;
+                                }
+                                if (found) {
+                                    if (*t_min < 0 || ts < *t_min) *t_min = ts;
+                                    if (*t_max < 0 || ts > *t_max) *t_max = ts;
+                                }
+                            }
+                            fclose(fp);
+                        }
+                    }
+                    free(filelist[j]);
+                }
+                free(filelist);
+            }
+        }
+        free(streamlist[i]);
+    }
+    free(streamlist);
+}
+
 void process_all_dates(const char *root_dir, double tstart, double tend, StreamList *stream_list, int timeline_width, int pass, long *file_count) {
     time_t current_t = (time_t)tstart;
     time_t end_t = (time_t)tend;
@@ -489,6 +552,7 @@ int main(int argc, char *argv[]) {
     char *root_dir = NULL;
     char *tstart_str = NULL;
     char *tend_str = NULL;
+    int auto_adjust = 0;
 
     kscan_ctx.target_key_pattern[0] = '\0';
     kscan_ctx.target_stream[0] = '\0';
@@ -518,6 +582,8 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Error: -k requires an argument\n");
                 return 1;
             }
+        } else if (strcmp(argv[i], "-a") == 0) {
+            auto_adjust = 1;
         } else {
             if (pos_arg_count == 0) root_dir = argv[i];
             else if (pos_arg_count == 1) tstart_str = argv[i];
@@ -526,13 +592,38 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (pos_arg_count < 3) {
-        fprintf(stderr, "Usage: %s [-k KEY] <dir> <tstart> <tend>\n", argv[0]);
+    if (pos_arg_count < 2 || (!auto_adjust && pos_arg_count < 3)) {
+        fprintf(stderr, "Usage: %s [-k KEY] [-a] <dir> <tstart> [<tend>]\n", argv[0]);
         return 1;
     }
 
     double tstart = parse_time_arg(tstart_str);
-    double tend = parse_time_arg(tend_str);
+    double tend = 0.0;
+
+    if (auto_adjust) {
+        // Parse date from tstart_str
+        char date_str[32];
+        if (strncmp(tstart_str, "UT", 2) == 0) {
+             // Expect UTYYYYMMDD...
+             strncpy(date_str, tstart_str + 2, 8);
+             date_str[8] = '\0';
+        } else {
+             // If unix timestamp, convert to date
+             time_t t = (time_t)tstart;
+             struct tm tm_val;
+             gmtime_r(&t, &tm_val);
+             snprintf(date_str, sizeof(date_str), "%04d%02d%02d",
+                 tm_val.tm_year + 1900, tm_val.tm_mon + 1, tm_val.tm_mday);
+        }
+
+        get_date_bounds(root_dir, date_str, &tstart, &tend);
+        if (tstart < 0 || tend < 0) {
+            fprintf(stderr, "Error: No data found in %s/%s to determine time range.\n", root_dir, date_str);
+            return 1;
+        }
+    } else {
+        tend = parse_time_arg(tend_str);
+    }
 
     if (tstart >= tend) {
         fprintf(stderr, "Error: tstart must be less than tend\n");
@@ -687,7 +778,9 @@ int main(int argc, char *argv[]) {
                     idx = 1;
                 }
             }
-            printf("%s", BG_SCALE);
+            if (idx == 0) printf("%s", BG_BLACK);
+            else printf("%s", BG_SCALE);
+
             if (idx > 0) printf("%s", COLORS[idx]);
             printf("%s", BLOCKS[idx]);
             printf(RESET_COLOR);
@@ -769,7 +862,9 @@ int main(int argc, char *argv[]) {
     printf("\nLegend: ' ' = 0 frames. Blocks show relative density (normalized to peak frame rate per stream).\n");
     printf("Scale: ");
     for (int i = 0; i < 9; i++) {
-        printf("%s", BG_SCALE);
+        if (i == 0) printf("%s", BG_BLACK);
+        else printf("%s", BG_SCALE);
+
         if (i > 0) printf("%s", COLORS[i]);
         printf("%s", BLOCKS[i]);
         printf(RESET_COLOR);
