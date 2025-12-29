@@ -313,6 +313,7 @@ void process_header_for_key(const char *header_path, const char *stream_name, do
 
 // pass 0 = count frames only, pass 1 = binning and headers
 void scan_stream_dir(const char *path, const char *stream_name, double tstart, double tend, StreamList *streams, int num_bins, int pass, long *file_count) {
+    printf("Scanning %s\n", path);
     struct dirent **namelist;
     int n = scandir(path, &namelist, NULL, alphasort);
     if (n < 0) return;
