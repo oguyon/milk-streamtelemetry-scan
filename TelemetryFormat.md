@@ -39,7 +39,7 @@ The header part (starting with character #) provides a short description of the 
 * col6 : stream cnt0 index
 * col7 : stream cnt1 index
 
-The absolute time (col5) is the timestamp to be used for synchronization between frames. This time indicates the start of the frame exposure.
+The absolute time (col5) is the timestamp to be used for synchronization between frames. This time indicates the end of the frame exposure.
 
 Note: The timing data does not include the exposure time. It is safe to assume that the end of an exposure is the start of the next exposure, so the exposure time is the time offset between consecutive exposure start times.
 
