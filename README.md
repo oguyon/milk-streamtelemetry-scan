@@ -17,6 +17,10 @@ make
 milk-streamtelemetry-scan <dir> <tstart> <tend>
 ```
 
+## Example 
+In scexao6, /mnt/sdata05, run: 
+ ~/src/milk-streamtelemetry-scan/build/milk-streamtelemetry-scan -k OBJECT . UT20251106T05 UT20251106T08  
+
 ## Description
 List telemetry files that contain frames between unix time stamps `<tstart>` and `<tend>` in directory `<dir>`. 
 The program looks at timing files in the YYYYMMDD director(ies) matching the time range specified.
