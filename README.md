@@ -18,8 +18,13 @@ milk-streamtelemetry-scan <dir> <tstart> <tend>
 ```
 
 ## Example 
-In scexao6, /mnt/sdata05, run: 
+In scexao6, /mnt/sdata05, for the engineering night of 11/06/2025, run: 
+```
  ~/src/milk-streamtelemetry-scan/build/milk-streamtelemetry-scan -k OBJECT . UT20251106T05 UT20251106T08  
+```
+Here is the output: 
+<img width="1492" height="831" alt="scan_output" src="https://github.com/user-attachments/assets/4ab47900-10cc-4822-b979-d144f63ad96c" />
+
 
 ## Description
 List telemetry files that contain frames between unix time stamps `<tstart>` and `<tend>` in directory `<dir>`. 
