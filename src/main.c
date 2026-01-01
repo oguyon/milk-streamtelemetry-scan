@@ -32,10 +32,18 @@ const char *COLORS[] = {
 #define BG_BLACK "\033[40m"       // Black background
 
 typedef struct {
+    char *path;
+    double timestamp;
+} FileEntry;
+
+typedef struct {
     char name[256];
     long total_frames;
     int *bins;
     int max_bin_count;
+    FileEntry *files;
+    int file_count;
+    int file_capacity;
 } Stream;
 
 typedef struct {
@@ -130,12 +138,30 @@ Stream* get_or_create_stream(StreamList *list, const char *name) {
     s->total_frames = 0;
     s->bins = NULL;
     s->max_bin_count = 0;
+    s->files = NULL;
+    s->file_count = 0;
+    s->file_capacity = 0;
     return s;
+}
+
+void add_file_to_stream(Stream *s, const char *path, double timestamp) {
+    if (s->file_count == s->file_capacity) {
+        s->file_capacity = (s->file_capacity == 0) ? 10 : s->file_capacity * 2;
+        s->files = realloc(s->files, s->file_capacity * sizeof(FileEntry));
+    }
+    s->files[s->file_count].path = strdup(path);
+    s->files[s->file_count].timestamp = timestamp;
+    s->file_count++;
 }
 
 void free_stream_list(StreamList *list) {
     for (int i = 0; i < list->count; i++) {
-        if (list->streams[i].bins) free(list->streams[i].bins);
+        Stream *s = &list->streams[i];
+        if (s->bins) free(s->bins);
+        for (int j = 0; j < s->file_count; j++) {
+            free(s->files[j].path);
+        }
+        if (s->files) free(s->files);
     }
     free(list->streams);
 }
@@ -322,12 +348,91 @@ void process_header_for_key(const char *header_path, const char *stream_name, do
     fclose(fp);
 }
 
-// pass 0 = count frames only, pass 1 = binning and headers
+double parse_filename_time(const char *filename, const char *date_str) {
+    // filename format: sname_HH:MM:SS.sssssssss.txt
+    // date_str: YYYYMMDD
+    // find the time part. It should be 18 chars before .txt
+    size_t len = strlen(filename);
+    if (len < 22) return 0.0; // Minimal check
+
+    // Pointer to start of time string
+    // Assuming format is always ending in ...HH:MM:SS.sssssssss.txt
+    const char *time_part = filename + len - 4 - 18;
+
+    // Reconstruct full ISO string: YYYYMMDDTHH:MM:SS.sssssssss
+    // But we need to use timegm.
+
+    struct tm tm_val;
+    memset(&tm_val, 0, sizeof(struct tm));
+
+    int year, month, day;
+    if (sscanf(date_str, "%4d%2d%2d", &year, &month, &day) != 3) return 0.0;
+
+    int hour, minute, second;
+    double frac_sec = 0.0;
+
+    if (sscanf(time_part, "%2d:%2d:%2d", &hour, &minute, &second) != 3) {
+         return 0.0;
+    }
+
+    // Parse fractional seconds
+    const char *frac_str = time_part + 8; // .sssssssss
+    frac_sec = atof(frac_str);
+
+    tm_val.tm_year = year - 1900;
+    tm_val.tm_mon = month - 1;
+    tm_val.tm_mday = day;
+    tm_val.tm_hour = hour;
+    tm_val.tm_min = minute;
+    tm_val.tm_sec = second;
+
+    time_t t = timegm(&tm_val);
+    return (double)t + frac_sec;
+}
+
+// pass 0 = count frames and populate file list, pass 1 = binning and headers (using cached files)
 void scan_stream_dir(const char *path, const char *stream_name, double tstart, double tend, StreamList *streams, int num_bins, int pass, long *file_count) {
+    if (pass != 0) return; // Only used for pass 0 now
+
     printf("Scanning %s\n", path);
     struct dirent **namelist;
     int n = scandir(path, &namelist, NULL, alphasort);
     if (n < 0) return;
+
+    // Get date from path (parent directory name)
+    // path format: .../YYYYMMDD/stream_name
+    char *path_copy = strdup(path);
+    // Remove trailing slash if any
+    size_t p_len = strlen(path_copy);
+    if (p_len > 0 && path_copy[p_len-1] == '/') path_copy[p_len-1] = '\0';
+
+    char *last_slash = strrchr(path_copy, '/');
+    char date_str[32] = {0};
+    if (last_slash) {
+        *last_slash = '\0'; // Terminate at stream_name slash
+        char *parent_slash = strrchr(path_copy, '/');
+        if (parent_slash) {
+             strncpy(date_str, parent_slash + 1, 31);
+        } else {
+             strncpy(date_str, path_copy, 31); // No parent slash, so this is the date dir?
+        }
+    } else {
+        // Should not happen given the structure, but fallback
+        strncpy(date_str, "19700101", 31);
+    }
+    free(path_copy);
+
+    // Pre-calculate timestamps for filtering
+    double *timestamps = malloc(n * sizeof(double));
+    for (int i = 0; i < n; i++) {
+        struct dirent *dir = namelist[i];
+        size_t len = strlen(dir->d_name);
+        if (len > 4 && strcmp(dir->d_name + len - 4, ".txt") == 0) {
+             timestamps[i] = parse_filename_time(dir->d_name, date_str);
+        } else {
+             timestamps[i] = 0.0;
+        }
+    }
 
     for (int i = 0; i < n; i++) {
         struct dirent *dir = namelist[i];
@@ -338,107 +443,151 @@ void scan_stream_dir(const char *path, const char *stream_name, double tstart, d
 
         size_t len = strlen(dir->d_name);
         if (len > 4 && strcmp(dir->d_name + len - 4, ".txt") == 0) {
-            if (pass == 0 && file_count) {
+
+            double file_ts = timestamps[i];
+
+            // Optimization: Skip files outside range
+            // 1. If this file starts after tend, we can stop (assuming sorted)
+            if (file_ts > tend) {
+                free(namelist[i]);
+                continue;
+                // We could break here if we trust sort order completely and that filenames are chronological.
+                // alphasort on "sname_HH..." is chronological.
+                // However, there might be other streams mixed in? No, directory is per stream.
+                // So break is safe.
+                // But let's be safe and just continue for now or check stream name consistency?
+                // The directory contains files for ONE stream: "sname".
+                // So break is safe.
+                // break;
+            }
+
+            // 2. If next file starts before tstart, then this file ends before tstart
+            // (assuming contiguous or close files)
+            int skip = 0;
+            // Find next valid file timestamp
+            for (int k = i + 1; k < n; k++) {
+                if (timestamps[k] > 0.0) {
+                    if (timestamps[k] < tstart) {
+                        skip = 1;
+                    }
+                    break;
+                }
+            }
+
+            if (skip) {
+                free(namelist[i]);
+                continue;
+            }
+
+            if (file_count) {
                 (*file_count)++;
             }
 
             char filepath[1024];
             snprintf(filepath, sizeof(filepath), "%s/%s", path, dir->d_name);
 
-            if (pass == 0) {
-                // Pass 0: Count frames
-                FILE *fp = fopen(filepath, "r");
-                if (fp) {
-                    Stream *s = get_or_create_stream(streams, stream_name);
-                    char line[1024];
-                    while (fgets(line, sizeof(line), fp)) {
-                        if (line[0] == '#') continue;
-                        char *token = strtok(line, " \t");
-                        int col = 0;
-                        double timestamp = 0.0;
-                        int found = 0;
-                        while (token) {
-                            if (col == 4) { timestamp = atof(token); found = 1; break; }
-                            token = strtok(NULL, " \t");
-                            col++;
-                        }
-                        if (found && timestamp >= tstart && timestamp <= tend) {
-                            s->total_frames++;
-                        }
-                    }
-                    fclose(fp);
-                }
-            } else if (pass == 1) {
-                // Pass 1: Binning and Headers
+            Stream *s = get_or_create_stream(streams, stream_name);
+            add_file_to_stream(s, filepath, file_ts);
 
-                // Header Scan
-                if (kscan_ctx.target_key_pattern[0] != '\0') {
-                    int process_this = 1;
-                    if (kscan_ctx.target_stream[0] != '\0' && strcmp(stream_name, kscan_ctx.target_stream) != 0) {
-                        process_this = 0;
+            // Pass 0: Count frames
+            FILE *fp = fopen(filepath, "r");
+            if (fp) {
+                char line[1024];
+                while (fgets(line, sizeof(line), fp)) {
+                    if (line[0] == '#') continue;
+                    char *token = strtok(line, " \t");
+                    int col = 0;
+                    double timestamp = 0.0;
+                    int found = 0;
+                    while (token) {
+                        if (col == 4) { timestamp = atof(token); found = 1; break; }
+                        token = strtok(NULL, " \t");
+                        col++;
                     }
-                    if (process_this) {
-                        char headerpath[1024];
-                        strncpy(headerpath, filepath, sizeof(headerpath));
-                        headerpath[strlen(filepath) - 4] = '\0';
-                        strncat(headerpath, ".fits.header", sizeof(headerpath) - strlen(headerpath) - 1);
-
-                        FILE *fp = fopen(filepath, "r");
-                        if (fp) {
-                            char line[1024];
-                            double file_ts = 0.0;
-                            while(fgets(line, sizeof(line), fp)) {
-                                if (line[0] == '#') continue;
-                                char *token = strtok(line, " \t");
-                                int col = 0;
-                                while (token) {
-                                    if (col == 4) { file_ts = atof(token); break; }
-                                    token = strtok(NULL, " \t");
-                                    col++;
-                                }
-                                if (file_ts > 0) break;
-                            }
-                            fclose(fp);
-                            if (file_ts >= tstart && file_ts <= tend) {
-                                process_header_for_key(headerpath, stream_name, file_ts);
-                            }
-                        }
+                    if (found && timestamp >= tstart && timestamp <= tend) {
+                        s->total_frames++;
                     }
                 }
-
-                // Binning
-                FILE *fp = fopen(filepath, "r");
-                if (fp) {
-                    Stream *s = get_or_create_stream(streams, stream_name);
-                    char line[1024];
-                    while (fgets(line, sizeof(line), fp)) {
-                        if (line[0] == '#') continue;
-                        char *token = strtok(line, " \t");
-                        int col = 0;
-                        double timestamp = 0.0;
-                        int found = 0;
-                        while (token) {
-                            if (col == 4) { timestamp = atof(token); found = 1; break; }
-                            token = strtok(NULL, " \t");
-                            col++;
-                        }
-                        if (found && timestamp >= tstart && timestamp <= tend) {
-                            int bin = (int)((timestamp - tstart) / (tend - tstart) * num_bins);
-                            if (bin < 0) bin = 0;
-                            if (bin >= num_bins) bin = num_bins - 1;
-                            s->bins[bin]++;
-                            if (s->bins[bin] > s->max_bin_count) {
-                                s->max_bin_count = s->bins[bin];
-                            }
-                        }
-                    }
-                    fclose(fp);
-                }
+                fclose(fp);
             }
         }
         free(namelist[i]);
     }
+    free(timestamps);
     free(namelist);
+}
+
+void process_stream_data(StreamList *stream_list, double tstart, double tend, int num_bins) {
+    for (int i = 0; i < stream_list->count; i++) {
+        Stream *s = &stream_list->streams[i];
+
+        for (int j = 0; j < s->file_count; j++) {
+            char *filepath = s->files[j].path;
+
+            // Header Scan
+            if (kscan_ctx.target_key_pattern[0] != '\0') {
+                int process_this = 1;
+                if (kscan_ctx.target_stream[0] != '\0' && strcmp(s->name, kscan_ctx.target_stream) != 0) {
+                    process_this = 0;
+                }
+                if (process_this) {
+                    char headerpath[1024];
+                    strncpy(headerpath, filepath, sizeof(headerpath));
+                    headerpath[strlen(filepath) - 4] = '\0';
+                    strncat(headerpath, ".fits.header", sizeof(headerpath) - strlen(headerpath) - 1);
+
+                    FILE *fp = fopen(filepath, "r");
+                    if (fp) {
+                        char line[1024];
+                        double file_ts = 0.0;
+                        while(fgets(line, sizeof(line), fp)) {
+                            if (line[0] == '#') continue;
+                            char *token = strtok(line, " \t");
+                            int col = 0;
+                            while (token) {
+                                if (col == 4) { file_ts = atof(token); break; }
+                                token = strtok(NULL, " \t");
+                                col++;
+                            }
+                            if (file_ts > 0) break;
+                        }
+                        fclose(fp);
+                        if (file_ts >= tstart && file_ts <= tend) {
+                            process_header_for_key(headerpath, s->name, file_ts);
+                        }
+                    }
+                }
+            }
+
+            // Binning
+            FILE *fp = fopen(filepath, "r");
+            if (fp) {
+                char line[1024];
+                while (fgets(line, sizeof(line), fp)) {
+                    if (line[0] == '#') continue;
+                    char *token = strtok(line, " \t");
+                    int col = 0;
+                    double timestamp = 0.0;
+                    int found = 0;
+                    while (token) {
+                        if (col == 4) { timestamp = atof(token); found = 1; break; }
+                        token = strtok(NULL, " \t");
+                        col++;
+                    }
+                    if (found && timestamp >= tstart && timestamp <= tend) {
+                        int bin = (int)((timestamp - tstart) / (tend - tstart) * num_bins);
+                        if (bin < 0) bin = 0;
+                        if (bin >= num_bins) bin = num_bins - 1;
+                        s->bins[bin]++;
+                        if (s->bins[bin] > s->max_bin_count) {
+                            s->max_bin_count = s->bins[bin];
+                        }
+                    }
+                }
+                fclose(fp);
+            }
+        }
+    }
 }
 
 void get_date_bounds(const char *root_dir, const char *date_str, double *t_min, double *t_max) {
@@ -670,7 +819,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Pass 2: Data processing
-    process_all_dates(root_dir, tstart, tend, &stream_list, timeline_width, 1, NULL);
+    process_stream_data(&stream_list, tstart, tend, timeline_width);
 
     // Handle end of keyword tracking
     for (int i = 0; i < kscan_ctx.tracked_count; i++) {
