@@ -485,7 +485,7 @@ void get_date_bounds(const char *root_dir, const char *date_str, double *t_min, 
                                     token = strtok(NULL, " \t");
                                     col++;
                                 }
-                                if (found) {
+                                if (found && ts > 0.0) {
                                     if (*t_min < 0 || ts < *t_min) *t_min = ts;
                                     if (*t_max < 0 || ts > *t_max) *t_max = ts;
                                 }
