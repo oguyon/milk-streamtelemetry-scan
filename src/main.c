@@ -370,6 +370,22 @@ long g_cache_searched = 0;
 long g_cache_found = 0;
 long g_cache_created = 0;
 
+void print_help(const char *progname) {
+    fprintf(stderr, "Usage: %s [options] <dir> <tstart> [<tend>]\n", progname);
+    fprintf(stderr, "\nArguments:\n");
+    fprintf(stderr, "  <dir>                 Root directory for telemetry data.\n");
+    fprintf(stderr, "  <tstart>              Start time (e.g., UTYYYYMMDDTHH:MM:SS or unix timestamp).\n");
+    fprintf(stderr, "  <tend>                End time (optional if -a is used).\n");
+    fprintf(stderr, "\nOptions:\n");
+    fprintf(stderr, "  -k <KEYNAME>          Search for keyword <KEYNAME> in FITS headers.\n");
+    fprintf(stderr, "  -k <STREAM>:<KEY>     Search for <KEY> only in <STREAM>.\n");
+    fprintf(stderr, "  -a                    Auto-adjust time range to data in date directory.\n");
+    fprintf(stderr, "  -cacheexport          Write cache to source directory instead of local cache/.\n");
+    fprintf(stderr, "  -nc                   No Cache. Disable cache reading and writing.\n");
+    fprintf(stderr, "  -prof                 Enable profiling output.\n");
+    fprintf(stderr, "  -h, --help            Show this help message.\n");
+}
+
 // Profiling globals
 int g_profile = 0;
 struct {
@@ -1043,7 +1059,10 @@ int main(int argc, char *argv[]) {
 
     int pos_arg_count = 0;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-k") == 0) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_help(argv[0]);
+            return 0;
+        } else if (strcmp(argv[i], "-k") == 0) {
             if (i + 1 < argc) {
                 char *karg = argv[++i];
                 char *colon = strchr(karg, ':');
@@ -1079,7 +1098,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (pos_arg_count < 2 || (!auto_adjust && pos_arg_count < 3)) {
-        fprintf(stderr, "Usage: %s [-k KEY] [-a] <dir> <tstart> [<tend>]\n", argv[0]);
+        print_help(argv[0]);
         return 1;
     }
 
