@@ -365,6 +365,7 @@ void write_cache(const char *cache_path, const FileSummary *summary) {
 // Global context for keyword scanning
 KeyScanContext kscan_ctx;
 int g_cache_export = 0;
+int g_no_cache = 0;
 long g_cache_searched = 0;
 long g_cache_found = 0;
 long g_cache_created = 0;
@@ -509,34 +510,37 @@ double parse_filename_time(const char *filename, const char *date_str) {
 }
 
 void get_file_data(const char *filepath, FileSummary *summary) {
-    g_cache_searched++;
     // Construct both potential cache paths
     char local_cache_path[8192];
-    snprintf(local_cache_path, sizeof(local_cache_path), "%s/%s%s", CACHE_DIR, filepath, CACHE_EXT);
-
     char export_cache_path[8192];
     char *dir_sep = strrchr(filepath, '/');
-    if (dir_sep) {
-        char dir_path[4096];
-        size_t dir_len = dir_sep - filepath;
-        if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
-        strncpy(dir_path, filepath, dir_len);
-        dir_path[dir_len] = '\0';
-        snprintf(export_cache_path, sizeof(export_cache_path), "%s/%s/%s%s", dir_path, CACHE_DIR, dir_sep + 1, CACHE_EXT);
-    } else {
-         snprintf(export_cache_path, sizeof(export_cache_path), "%s/%s%s", CACHE_DIR, filepath, CACHE_EXT);
-    }
 
-    // Try reading (Priority: Local, then Export)
-    // Actually, user said: "The program will look for the cache in both location, and report if found."
-    // We check local first.
-    if (read_cache(local_cache_path, summary)) {
-        g_cache_found++;
-        return;
-    }
-    if (read_cache(export_cache_path, summary)) {
-        g_cache_found++;
-        return;
+    if (!g_no_cache) {
+        g_cache_searched++;
+        snprintf(local_cache_path, sizeof(local_cache_path), "%s/%s%s", CACHE_DIR, filepath, CACHE_EXT);
+
+        if (dir_sep) {
+            char dir_path[4096];
+            size_t dir_len = dir_sep - filepath;
+            if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
+            strncpy(dir_path, filepath, dir_len);
+            dir_path[dir_len] = '\0';
+            snprintf(export_cache_path, sizeof(export_cache_path), "%s/%s/%s%s", dir_path, CACHE_DIR, dir_sep + 1, CACHE_EXT);
+        } else {
+             snprintf(export_cache_path, sizeof(export_cache_path), "%s/%s%s", CACHE_DIR, filepath, CACHE_EXT);
+        }
+
+        // Try reading (Priority: Local, then Export)
+        // Actually, user said: "The program will look for the cache in both location, and report if found."
+        // We check local first.
+        if (read_cache(local_cache_path, summary)) {
+            g_cache_found++;
+            return;
+        }
+        if (read_cache(export_cache_path, summary)) {
+            g_cache_found++;
+            return;
+        }
     }
 
     // Cache miss, process text file
@@ -606,23 +610,25 @@ void get_file_data(const char *filepath, FileSummary *summary) {
     }
 
     // Write cache
-    if (g_cache_export) {
-        if (dir_sep) {
-            char dir_path[4096];
-            size_t dir_len = dir_sep - filepath;
-            if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
-            strncpy(dir_path, filepath, dir_len);
-            dir_path[dir_len] = '\0';
-            ensure_cache_dir_exists(dir_path);
+    if (!g_no_cache) {
+        if (g_cache_export) {
+            if (dir_sep) {
+                char dir_path[4096];
+                size_t dir_len = dir_sep - filepath;
+                if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
+                strncpy(dir_path, filepath, dir_len);
+                dir_path[dir_len] = '\0';
+                ensure_cache_dir_exists(dir_path);
+            } else {
+                ensure_cache_dir_exists(".");
+            }
+            write_cache(export_cache_path, summary);
         } else {
-            ensure_cache_dir_exists(".");
+            ensure_path_exists(local_cache_path);
+            write_cache(local_cache_path, summary);
         }
-        write_cache(export_cache_path, summary);
-    } else {
-        ensure_path_exists(local_cache_path);
-        write_cache(local_cache_path, summary);
+        g_cache_created++;
     }
-    g_cache_created++;
 }
 
 // pass 0 = count frames and populate file list, pass 1 = binning and headers (using cached files)
@@ -1026,6 +1032,8 @@ int main(int argc, char *argv[]) {
             auto_adjust = 1;
         } else if (strcmp(argv[i], "-cacheexport") == 0) {
             g_cache_export = 1;
+        } else if (strcmp(argv[i], "-nc") == 0) {
+            g_no_cache = 1;
         } else {
             if (pos_arg_count == 0) root_dir = argv[i];
             else if (pos_arg_count == 1) tstart_str = argv[i];
