@@ -839,7 +839,12 @@ void get_file_data(const char *filepath, FileSummary *summary) {
             }
 
             char bcache_path[8192];
-            snprintf(bcache_path, sizeof(bcache_path), "%s/%s", date_dir_path, BINARY_CACHE_FILENAME);
+            if (g_cache_export) {
+                snprintf(bcache_path, sizeof(bcache_path), "%s/%s", date_dir_path, BINARY_CACHE_FILENAME);
+            } else {
+                snprintf(bcache_path, sizeof(bcache_path), "%s/%s/%s", CACHE_DIR, date_dir_path, BINARY_CACHE_FILENAME);
+                ensure_path_exists(bcache_path);
+            }
 
             // Check if loaded matches
             if (!g_binary_cache || strcmp(g_binary_cache->filepath, bcache_path) != 0) {
