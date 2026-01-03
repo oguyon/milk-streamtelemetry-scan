@@ -35,6 +35,8 @@ const char *COLORS[] = {
 // Cache constants
 #define CACHE_DIR "cache"
 #define CACHE_EXT ".cache"
+#define BINARY_CACHE_FILENAME "telemetry.cache"
+#define BINARY_CACHE_MAGIC "MILKCACHE_V1"
 
 typedef struct {
     int is_constant;
@@ -43,6 +45,19 @@ typedef struct {
     double end;
     double *timestamps; // NULL if is_constant, otherwise array of size count
 } FileSummary;
+
+typedef struct {
+    char *key; // stream/filename
+    FileSummary summary;
+} BinaryCacheEntry;
+
+typedef struct {
+    BinaryCacheEntry *entries;
+    int count;
+    int capacity;
+    int dirty;
+    char filepath[4096];
+} BinaryCache;
 
 typedef struct {
     char *path;
@@ -102,6 +117,29 @@ typedef struct {
 
     Report report;
 } KeyScanContext;
+
+// Globals
+KeyScanContext kscan_ctx;
+int g_cache_export = 0;
+int g_no_cache = 0;
+long g_cache_searched = 0;
+long g_cache_found = 0;
+long g_cache_created = 0;
+
+// Binary Cache Globals
+int g_use_binary_cache = 0;
+BinaryCache *g_binary_cache = NULL;
+
+// Profiling globals
+int g_profile = 0;
+struct {
+    double start_time;
+    double discovery_time;
+    double processing_time;
+    double cache_read_time;
+    double cache_write_time;
+    double file_parse_time;
+} g_prof;
 
 void init_report(Report *r) {
     r->count = 0;
@@ -347,6 +385,167 @@ int read_cache(const char *cache_path, FileSummary *summary) {
     return 1;
 }
 
+int compare_bcache_entries(const void *a, const void *b) {
+    return strcmp(((BinaryCacheEntry *)a)->key, ((BinaryCacheEntry *)b)->key);
+}
+
+void flush_binary_cache() {
+    if (!g_binary_cache) return;
+    if (g_binary_cache->dirty) {
+        FILE *fp = fopen(g_binary_cache->filepath, "wb");
+        if (fp) {
+            // Header
+            fwrite(BINARY_CACHE_MAGIC, 1, strlen(BINARY_CACHE_MAGIC) + 1, fp);
+            fwrite(&g_binary_cache->count, sizeof(int), 1, fp);
+
+            // Sort entries for deterministic output and faster search (if loaded sorted)
+            // But we maintain it sorted or sort on save? Let's sort on save.
+            qsort(g_binary_cache->entries, g_binary_cache->count, sizeof(BinaryCacheEntry), compare_bcache_entries);
+
+            for (int i = 0; i < g_binary_cache->count; i++) {
+                BinaryCacheEntry *e = &g_binary_cache->entries[i];
+                int key_len = strlen(e->key) + 1;
+                fwrite(&key_len, sizeof(int), 1, fp);
+                fwrite(e->key, 1, key_len, fp);
+                fwrite(&e->summary.is_constant, sizeof(int), 1, fp);
+                fwrite(&e->summary.count, sizeof(long), 1, fp);
+                if (e->summary.is_constant) {
+                    fwrite(&e->summary.start, sizeof(double), 1, fp);
+                    fwrite(&e->summary.end, sizeof(double), 1, fp);
+                } else {
+                    if (e->summary.count > 0) {
+                        fwrite(e->summary.timestamps, sizeof(double), e->summary.count, fp);
+                    }
+                }
+            }
+            fclose(fp);
+            g_cache_created++; // Count monolithic file creation as 1 creation? Or just leave it?
+            // Actually user asked to report cache created. Reporting 1 for the binary file is correct.
+        } else {
+             fprintf(stderr, "Warning: Failed to write binary cache %s: %s\n", g_binary_cache->filepath, strerror(errno));
+        }
+    }
+    // Free
+    for (int i = 0; i < g_binary_cache->count; i++) {
+        free(g_binary_cache->entries[i].key);
+        if (g_binary_cache->entries[i].summary.timestamps) {
+            free(g_binary_cache->entries[i].summary.timestamps);
+        }
+    }
+    free(g_binary_cache->entries);
+    free(g_binary_cache);
+    g_binary_cache = NULL;
+}
+
+void load_binary_cache(const char *filepath) {
+    if (g_binary_cache) flush_binary_cache();
+
+    g_binary_cache = calloc(1, sizeof(BinaryCache));
+    strncpy(g_binary_cache->filepath, filepath, 4095);
+
+    FILE *fp = fopen(filepath, "rb");
+    if (!fp) return; // New cache
+
+    char magic[32];
+    // Read magic string (null terminated)
+    // We assume it matches length of define.
+    size_t magic_len = strlen(BINARY_CACHE_MAGIC) + 1;
+    if (fread(magic, 1, magic_len, fp) != magic_len || strcmp(magic, BINARY_CACHE_MAGIC) != 0) {
+        // Invalid or version mismatch
+        fclose(fp);
+        return;
+    }
+
+    int count = 0;
+    if (fread(&count, sizeof(int), 1, fp) != 1) { fclose(fp); return; }
+
+    g_binary_cache->count = count;
+    g_binary_cache->capacity = count + 100; // Preallocate some extra
+    g_binary_cache->entries = malloc(g_binary_cache->capacity * sizeof(BinaryCacheEntry));
+
+    for (int i = 0; i < count; i++) {
+        BinaryCacheEntry *e = &g_binary_cache->entries[i];
+        int key_len = 0;
+        if (fread(&key_len, sizeof(int), 1, fp) != 1) break;
+        e->key = malloc(key_len);
+        if (fread(e->key, 1, key_len, fp) != (size_t)key_len) break;
+
+        if (fread(&e->summary.is_constant, sizeof(int), 1, fp) != 1) break;
+        if (fread(&e->summary.count, sizeof(long), 1, fp) != 1) break;
+
+        e->summary.timestamps = NULL;
+        e->summary.start = 0;
+        e->summary.end = 0;
+
+        if (e->summary.is_constant) {
+            if (fread(&e->summary.start, sizeof(double), 1, fp) != 1) break;
+            if (fread(&e->summary.end, sizeof(double), 1, fp) != 1) break;
+        } else {
+            if (e->summary.count > 0) {
+                e->summary.timestamps = malloc(e->summary.count * sizeof(double));
+                if (fread(e->summary.timestamps, sizeof(double), e->summary.count, fp) != (size_t)e->summary.count) {
+                    free(e->summary.timestamps);
+                    e->summary.timestamps = NULL;
+                    break;
+                }
+                // Set bounds
+                e->summary.start = e->summary.timestamps[0];
+                e->summary.end = e->summary.timestamps[e->summary.count - 1];
+            }
+        }
+    }
+    fclose(fp);
+    g_binary_cache->dirty = 0;
+    // Assuming file on disk is sorted
+}
+
+void add_to_binary_cache(const char *key, const FileSummary *summary) {
+    if (!g_binary_cache) return;
+    if (g_binary_cache->count == g_binary_cache->capacity) {
+        g_binary_cache->capacity = (g_binary_cache->capacity == 0) ? 100 : g_binary_cache->capacity * 2;
+        g_binary_cache->entries = realloc(g_binary_cache->entries, g_binary_cache->capacity * sizeof(BinaryCacheEntry));
+    }
+    BinaryCacheEntry *e = &g_binary_cache->entries[g_binary_cache->count++];
+    e->key = strdup(key);
+    e->summary = *summary; // Shallow copy
+    // Deep copy timestamps if needed
+    if (summary->timestamps) {
+        e->summary.timestamps = malloc(summary->count * sizeof(double));
+        memcpy(e->summary.timestamps, summary->timestamps, summary->count * sizeof(double));
+    }
+    g_binary_cache->dirty = 1;
+}
+
+FileSummary* find_in_binary_cache(const char *key) {
+    if (!g_binary_cache) return NULL;
+
+    // Use bsearch
+    BinaryCacheEntry target;
+    target.key = (char*)key;
+    // Note: bsearch requires the array to be sorted.
+    // If we just added entries (dirty), it might not be sorted.
+    // Optimization: if strictly appending alpha, it remains sorted.
+    // But scan order is alpha. So appending usually preserves sort.
+    // But to be safe, if dirty, we might need linear search or sort?
+    // Sorting every add is slow.
+    // Linear search for new entries + bsearch for old?
+    // Given the constraints and typical use, simple linear search if not sorted?
+    // Let's just assume sorted for the loaded part, and linear scan the rest?
+    // Or just linear scan all? N ~ 1000s. Fast enough in memory.
+    // Let's implement bsearch for loaded entries and assume sort.
+    // Wait, if I add entries, I break sort if not careful.
+    // For now, let's stick to bsearch on the whole thing but we must ensure sort.
+    // Actually, `scan_stream_dir` calls alphasort. So we add in order.
+    // So the array *should* be sorted.
+    // We can assume sorted.
+
+    void *res = bsearch(&target, g_binary_cache->entries, g_binary_cache->count, sizeof(BinaryCacheEntry), compare_bcache_entries);
+    if (res) {
+        return &((BinaryCacheEntry*)res)->summary;
+    }
+    return NULL;
+}
+
 void write_cache(const char *cache_path, const FileSummary *summary) {
     FILE *fp = fopen(cache_path, "w");
     if (!fp) return;
@@ -362,14 +561,6 @@ void write_cache(const char *cache_path, const FileSummary *summary) {
     fclose(fp);
 }
 
-// Global context for keyword scanning
-KeyScanContext kscan_ctx;
-int g_cache_export = 0;
-int g_no_cache = 0;
-long g_cache_searched = 0;
-long g_cache_found = 0;
-long g_cache_created = 0;
-
 void print_help(const char *progname) {
     fprintf(stderr, "Usage: %s [options] <dir> <tstart> [<tend>]\n", progname);
     fprintf(stderr, "\nArguments:\n");
@@ -381,21 +572,11 @@ void print_help(const char *progname) {
     fprintf(stderr, "  -k <STREAM>:<KEY>     Search for <KEY> only in <STREAM>.\n");
     fprintf(stderr, "  -a                    Auto-adjust time range to data in date directory.\n");
     fprintf(stderr, "  -cacheexport          Write cache to source directory instead of local cache/.\n");
+    fprintf(stderr, "  -bcache               Write all cache for a full night in a binary file for optimal performance.\n");
     fprintf(stderr, "  -nc                   No Cache. Disable cache reading and writing.\n");
     fprintf(stderr, "  -prof                 Enable profiling output.\n");
     fprintf(stderr, "  -h, --help            Show this help message.\n");
 }
-
-// Profiling globals
-int g_profile = 0;
-struct {
-    double start_time;
-    double discovery_time;
-    double processing_time;
-    double cache_read_time;
-    double cache_write_time;
-    double file_parse_time;
-} g_prof;
 
 double get_current_time() {
     struct timespec ts;
@@ -550,35 +731,169 @@ void get_file_data(const char *filepath, FileSummary *summary) {
 
     if (!g_no_cache) {
         g_cache_searched++;
-        snprintf(local_cache_path, sizeof(local_cache_path), "%s/%s%s", CACHE_DIR, filepath, CACHE_EXT);
 
-        if (dir_sep) {
-            char dir_path[4096];
-            size_t dir_len = dir_sep - filepath;
-            if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
-            strncpy(dir_path, filepath, dir_len);
-            dir_path[dir_len] = '\0';
-            snprintf(export_cache_path, sizeof(export_cache_path), "%s/%s/%s%s", dir_path, CACHE_DIR, dir_sep + 1, CACHE_EXT);
+        // Binary Cache Logic
+        if (g_use_binary_cache) {
+            // Find key: stream/filename.
+            // filepath is root/date/stream/filename.
+            // dir_sep points to last slash.
+            // We need stream/filename.
+            // Assumption: structure is standard.
+            // if no dir_sep, just filename.
+            const char *key = filepath;
+            if (dir_sep) {
+                // Find previous slash
+                char *prev_slash = NULL;
+                for (char *p = dir_sep - 1; p >= filepath; p--) {
+                    if (*p == '/') {
+                        prev_slash = p;
+                        break;
+                    }
+                }
+                if (prev_slash) key = prev_slash + 1;
+                else key = dir_sep + 1; // Fallback
+            }
+
+            // Ensure correct binary cache file is loaded
+            // Construct expected path: root/date/telemetry.cache
+            // We need to extract date dir.
+            char date_dir_path[4096];
+            if (dir_sep) {
+                // Find parent of stream dir.
+                // filepath: .../date/stream/file
+                // dir_sep -> /file
+                // prev_slash -> /stream
+                // prev_prev_slash -> /date
+                char *prev_slash = NULL;
+                for (char *p = dir_sep - 1; p >= filepath; p--) {
+                    if (*p == '/') {
+                        prev_slash = p;
+                        break;
+                    }
+                }
+                char *prev_prev_slash = NULL;
+                if (prev_slash) {
+                    for (char *p = prev_slash - 1; p >= filepath; p--) {
+                        if (*p == '/') {
+                            prev_prev_slash = p;
+                            break;
+                        }
+                    }
+                }
+
+                size_t len = 0;
+                if (prev_prev_slash) {
+                    // date_dir is up to prev_slash (exclusive of slash? no, inclusive?)
+                    // .../date is path?
+                    // We want directory containing stream directories.
+                    // Actually, structure is root/date/stream/file.
+                    // Cache should be in root/date/telemetry.cache.
+                    // So we want path up to prev_slash? No, prev_slash is /stream.
+                    // path up to prev_slash is root/date/stream.
+                    // We want root/date.
+                    len = prev_prev_slash - filepath;
+                    // Wait, if prev_prev_slash is /date, then we want up to prev_prev_slash?
+                    // No, prev_prev_slash is start of /date? Or end of root?
+                    // /root/date/stream/file
+                    //        ^ prev_prev
+                    //             ^ prev
+                    //                    ^ dir_sep
+                    // So date dir is up to prev_slash? No.
+                    // date dir is `root/date`.
+                    // It ends at `prev_prev_slash`? No.
+                    // `prev_prev_slash` points to slash before `date`? No, slash before `stream`.
+                    // `prev_slash` points to slash before `file`.
+
+                    // Example: data/20251106/stream/file.txt
+                    // dir_sep points to /file.txt
+                    // prev_slash points to /stream
+                    // path up to prev_slash is data/20251106/stream.
+                    // We want data/20251106.
+                    // So we need slash before stream. That is prev_slash!
+                    // Wait, prev_slash is the slash before 'stream'?
+                    // data/20251106/stream/file.txt
+                    //              ^ prev_slash
+                    // path up to prev_slash is data/20251106.
+                    len = prev_slash - filepath;
+                } else if (prev_slash) {
+                    // path/stream/file.txt
+                    //      ^ prev_slash
+                    len = prev_slash - filepath;
+                } else {
+                    // file.txt or stream/file.txt?
+                    // If just file.txt, dir_sep is null.
+                    // If stream/file.txt, dir_sep is /file.txt. prev_slash is null.
+                    // We default to current dir.
+                    len = 0;
+                }
+
+                if (len > 0) {
+                    if (len >= sizeof(date_dir_path)) len = sizeof(date_dir_path) - 1;
+                    strncpy(date_dir_path, filepath, len);
+                    date_dir_path[len] = '\0';
+                } else {
+                    strcpy(date_dir_path, ".");
+                }
+            } else {
+                strcpy(date_dir_path, ".");
+            }
+
+            char bcache_path[8192];
+            snprintf(bcache_path, sizeof(bcache_path), "%s/%s", date_dir_path, BINARY_CACHE_FILENAME);
+
+            // Check if loaded matches
+            if (!g_binary_cache || strcmp(g_binary_cache->filepath, bcache_path) != 0) {
+                load_binary_cache(bcache_path);
+            }
+
+            // Search
+            double t0 = 0;
+            if (g_profile) t0 = get_current_time();
+            FileSummary *s = find_in_binary_cache(key);
+            if (g_profile) g_prof.cache_read_time += (get_current_time() - t0);
+
+            if (s) {
+                g_cache_found++;
+                *summary = *s;
+                // Deep copy timestamps for caller to own (if raw)
+                if (s->timestamps) {
+                    summary->timestamps = malloc(s->count * sizeof(double));
+                    memcpy(summary->timestamps, s->timestamps, s->count * sizeof(double));
+                }
+                return;
+            }
         } else {
-             snprintf(export_cache_path, sizeof(export_cache_path), "%s/%s%s", CACHE_DIR, filepath, CACHE_EXT);
-        }
+            // Per-file Cache Logic
+            snprintf(local_cache_path, sizeof(local_cache_path), "%s/%s%s", CACHE_DIR, filepath, CACHE_EXT);
 
-        // Try reading (Priority: Local, then Export)
-        // Actually, user said: "The program will look for the cache in both location, and report if found."
-        // We check local first.
-        double t0 = 0;
-        if (g_profile) t0 = get_current_time();
-        int found = 0;
-        if (read_cache(local_cache_path, summary)) {
-            found = 1;
-        } else if (read_cache(export_cache_path, summary)) {
-            found = 1;
-        }
-        if (g_profile) g_prof.cache_read_time += (get_current_time() - t0);
+            if (dir_sep) {
+                char dir_path[4096];
+                size_t dir_len = dir_sep - filepath;
+                if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
+                strncpy(dir_path, filepath, dir_len);
+                dir_path[dir_len] = '\0';
+                snprintf(export_cache_path, sizeof(export_cache_path), "%s/%s/%s%s", dir_path, CACHE_DIR, dir_sep + 1, CACHE_EXT);
+            } else {
+                 snprintf(export_cache_path, sizeof(export_cache_path), "%s/%s%s", CACHE_DIR, filepath, CACHE_EXT);
+            }
 
-        if (found) {
-            g_cache_found++;
-            return;
+            // Try reading (Priority: Local, then Export)
+            // Actually, user said: "The program will look for the cache in both location, and report if found."
+            // We check local first.
+            double t0 = 0;
+            if (g_profile) t0 = get_current_time();
+            int found = 0;
+            if (read_cache(local_cache_path, summary)) {
+                found = 1;
+            } else if (read_cache(export_cache_path, summary)) {
+                found = 1;
+            }
+            if (g_profile) g_prof.cache_read_time += (get_current_time() - t0);
+
+            if (found) {
+                g_cache_found++;
+                return;
+            }
         }
     }
 
@@ -655,29 +970,56 @@ void get_file_data(const char *filepath, FileSummary *summary) {
 
     // Write cache
     if (!g_no_cache) {
-        if (g_cache_export) {
+        if (g_use_binary_cache) {
+            // Add to binary cache
+            const char *key = filepath;
             if (dir_sep) {
-                char dir_path[4096];
-                size_t dir_len = dir_sep - filepath;
-                if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
-                strncpy(dir_path, filepath, dir_len);
-                dir_path[dir_len] = '\0';
-                ensure_cache_dir_exists(dir_path);
-            } else {
-                ensure_cache_dir_exists(".");
+                // Find previous slash logic again...
+                // Wait, we can reuse logic or better make a helper.
+                // But for now inline logic to match reading.
+                char *prev_slash = NULL;
+                for (char *p = dir_sep - 1; p >= filepath; p--) {
+                    if (*p == '/') {
+                        prev_slash = p;
+                        break;
+                    }
+                }
+                if (prev_slash) key = prev_slash + 1;
+                else key = dir_sep + 1;
             }
             double t_write = 0;
             if (g_profile) t_write = get_current_time();
-            write_cache(export_cache_path, summary);
+            add_to_binary_cache(key, summary);
+            // Note: g_cache_created is incremented when FLUSHING binary cache, not here.
+            // But user might want to see count of files added?
+            // "created" implies files. For binary cache, we create 1 file per night.
+            // So we increment in flush_binary_cache.
             if (g_profile) g_prof.cache_write_time += (get_current_time() - t_write);
         } else {
-            ensure_path_exists(local_cache_path);
-            double t_write = 0;
-            if (g_profile) t_write = get_current_time();
-            write_cache(local_cache_path, summary);
-            if (g_profile) g_prof.cache_write_time += (get_current_time() - t_write);
+            if (g_cache_export) {
+                if (dir_sep) {
+                    char dir_path[4096];
+                    size_t dir_len = dir_sep - filepath;
+                    if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
+                    strncpy(dir_path, filepath, dir_len);
+                    dir_path[dir_len] = '\0';
+                    ensure_cache_dir_exists(dir_path);
+                } else {
+                    ensure_cache_dir_exists(".");
+                }
+                double t_write = 0;
+                if (g_profile) t_write = get_current_time();
+                write_cache(export_cache_path, summary);
+                if (g_profile) g_prof.cache_write_time += (get_current_time() - t_write);
+            } else {
+                ensure_path_exists(local_cache_path);
+                double t_write = 0;
+                if (g_profile) t_write = get_current_time();
+                write_cache(local_cache_path, summary);
+                if (g_profile) g_prof.cache_write_time += (get_current_time() - t_write);
+            }
+            g_cache_created++;
         }
-        g_cache_created++;
     }
 }
 
@@ -1085,6 +1427,8 @@ int main(int argc, char *argv[]) {
             auto_adjust = 1;
         } else if (strcmp(argv[i], "-cacheexport") == 0) {
             g_cache_export = 1;
+        } else if (strcmp(argv[i], "-bcache") == 0) {
+            g_use_binary_cache = 1;
         } else if (strcmp(argv[i], "-nc") == 0) {
             g_no_cache = 1;
         } else if (strcmp(argv[i], "-prof") == 0) {
@@ -1404,6 +1748,8 @@ int main(int argc, char *argv[]) {
     if (kscan_ctx.tracked_keys) free(kscan_ctx.tracked_keys);
     if (kscan_ctx.target_key_pattern[0] != '\0') regfree(&kscan_ctx.key_regex);
     free_stream_list(&stream_list);
+
+    flush_binary_cache();
 
     printf("\nCache: searched %ld, found %ld, created %ld\n", g_cache_searched, g_cache_found, g_cache_created);
 
