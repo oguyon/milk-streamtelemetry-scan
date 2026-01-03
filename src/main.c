@@ -370,6 +370,23 @@ long g_cache_searched = 0;
 long g_cache_found = 0;
 long g_cache_created = 0;
 
+// Profiling globals
+int g_profile = 0;
+struct {
+    double start_time;
+    double discovery_time;
+    double processing_time;
+    double cache_read_time;
+    double cache_write_time;
+    double file_parse_time;
+} g_prof;
+
+double get_current_time() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
 TrackedKey* get_tracked_key(const char *stream, const char *key) {
     for (int i = 0; i < kscan_ctx.tracked_count; i++) {
         if (strcmp(kscan_ctx.tracked_keys[i].stream_name, stream) == 0 &&
@@ -533,11 +550,17 @@ void get_file_data(const char *filepath, FileSummary *summary) {
         // Try reading (Priority: Local, then Export)
         // Actually, user said: "The program will look for the cache in both location, and report if found."
         // We check local first.
+        double t0 = 0;
+        if (g_profile) t0 = get_current_time();
+        int found = 0;
         if (read_cache(local_cache_path, summary)) {
-            g_cache_found++;
-            return;
+            found = 1;
+        } else if (read_cache(export_cache_path, summary)) {
+            found = 1;
         }
-        if (read_cache(export_cache_path, summary)) {
+        if (g_profile) g_prof.cache_read_time += (get_current_time() - t0);
+
+        if (found) {
             g_cache_found++;
             return;
         }
@@ -549,6 +572,9 @@ void get_file_data(const char *filepath, FileSummary *summary) {
     summary->timestamps = NULL;
     summary->start = 0;
     summary->end = 0;
+
+    double t_parse_start = 0;
+    if (g_profile) t_parse_start = get_current_time();
 
     FILE *fp = fopen(filepath, "r");
     if (!fp) return;
@@ -579,6 +605,8 @@ void get_file_data(const char *filepath, FileSummary *summary) {
         }
     }
     fclose(fp);
+
+    if (g_profile) g_prof.file_parse_time += (get_current_time() - t_parse_start);
 
     summary->count = count;
     summary->timestamps = ts_arr;
@@ -622,10 +650,16 @@ void get_file_data(const char *filepath, FileSummary *summary) {
             } else {
                 ensure_cache_dir_exists(".");
             }
+            double t_write = 0;
+            if (g_profile) t_write = get_current_time();
             write_cache(export_cache_path, summary);
+            if (g_profile) g_prof.cache_write_time += (get_current_time() - t_write);
         } else {
             ensure_path_exists(local_cache_path);
+            double t_write = 0;
+            if (g_profile) t_write = get_current_time();
             write_cache(local_cache_path, summary);
+            if (g_profile) g_prof.cache_write_time += (get_current_time() - t_write);
         }
         g_cache_created++;
     }
@@ -1034,6 +1068,8 @@ int main(int argc, char *argv[]) {
             g_cache_export = 1;
         } else if (strcmp(argv[i], "-nc") == 0) {
             g_no_cache = 1;
+        } else if (strcmp(argv[i], "-prof") == 0) {
+            g_profile = 1;
         } else {
             if (pos_arg_count == 0) root_dir = argv[i];
             else if (pos_arg_count == 1) tstart_str = argv[i];
@@ -1090,9 +1126,14 @@ int main(int argc, char *argv[]) {
     StreamList stream_list;
     init_stream_list(&stream_list);
 
+    if (g_profile) g_prof.start_time = get_current_time();
+
     long file_count = 0;
     // Pass 1: Discovery and counts
+    double t_disc_start = 0;
+    if (g_profile) t_disc_start = get_current_time();
     process_all_dates(root_dir, tstart, tend, &stream_list, 0, 0, &file_count);
+    if (g_profile) g_prof.discovery_time += (get_current_time() - t_disc_start);
 
     // Calculate formatting
     int max_name_len = 10;
@@ -1120,7 +1161,10 @@ int main(int argc, char *argv[]) {
     }
 
     // Pass 2: Data processing
+    double t_proc_start = 0;
+    if (g_profile) t_proc_start = get_current_time();
     process_stream_data(&stream_list, tstart, tend, timeline_width);
+    if (g_profile) g_prof.processing_time += (get_current_time() - t_proc_start);
 
     // Handle end of keyword tracking
     for (int i = 0; i < kscan_ctx.tracked_count; i++) {
@@ -1343,6 +1387,17 @@ int main(int argc, char *argv[]) {
     free_stream_list(&stream_list);
 
     printf("\nCache: searched %ld, found %ld, created %ld\n", g_cache_searched, g_cache_found, g_cache_created);
+
+    if (g_profile) {
+        printf("\nProfiling Summary:\n");
+        printf("Total Time:       %9.6f s\n", get_current_time() - g_prof.start_time);
+        printf("Discovery Pass:   %9.6f s\n", g_prof.discovery_time);
+        printf("Processing Pass:  %9.6f s\n", g_prof.processing_time);
+        printf("Details (cumulative):\n");
+        printf("  Cache Read:     %9.6f s\n", g_prof.cache_read_time);
+        printf("  File Parse:     %9.6f s\n", g_prof.file_parse_time);
+        printf("  Cache Write:    %9.6f s\n", g_prof.cache_write_time);
+    }
 
     return 0;
 }
