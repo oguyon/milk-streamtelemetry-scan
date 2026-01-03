@@ -641,7 +641,7 @@ void get_file_data(const char *filepath, FileSummary *summary) {
         int constant = 1;
         for (long i = 0; i < count - 1; i++) {
             double dt = ts_arr[i+1] - ts_arr[i];
-            if (fabs(dt - mean_dt) > 0.05 * mean_dt) {
+            if (fabs(dt - mean_dt) > 0.10 * mean_dt) {
                 constant = 0;
                 break;
             }
