@@ -9,6 +9,7 @@
 #include <math.h>
 #include <regex.h>
 #include <sys/ioctl.h>
+#include <errno.h>
 
 // Unicode Block Elements
 const char *BLOCKS[] = {" ", "\u2588", "\u2588", "\u2588", "\u2588", "\u2588", "\u2588", "\u2588", "\u2588"};
@@ -261,11 +262,15 @@ int read_header_keyword(const char *filepath, const char *key, char *value_out) 
 }
 
 void ensure_cache_dir_exists(const char *parent_dir) {
-    char cache_path[1024];
+    char cache_path[4096];
     snprintf(cache_path, sizeof(cache_path), "%s/%s", parent_dir, CACHE_DIR);
     struct stat st = {0};
     if (stat(cache_path, &st) == -1) {
-        mkdir(cache_path, 0755);
+        if (mkdir(cache_path, 0755) != 0) {
+            if (errno != EEXIST) {
+                 fprintf(stderr, "Warning: Failed to create cache directory %s: %s\n", cache_path, strerror(errno));
+            }
+        }
     }
 }
 
@@ -557,11 +562,14 @@ void get_file_data(const char *filepath, FileSummary *summary) {
 
     // Write cache
     if (dir_sep) {
-        char dir_path[1024];
+        char dir_path[4096];
         size_t dir_len = dir_sep - filepath;
+        if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
         strncpy(dir_path, filepath, dir_len);
         dir_path[dir_len] = '\0';
         ensure_cache_dir_exists(dir_path);
+    } else {
+        ensure_cache_dir_exists(".");
     }
     write_cache(cache_path, summary);
 }
