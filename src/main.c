@@ -31,6 +31,18 @@ const char *COLORS[] = {
 #define BG_SCALE "\033[48;5;237m" // Dark Grey background
 #define BG_BLACK "\033[40m"       // Black background
 
+// Cache constants
+#define CACHE_DIR "cache"
+#define CACHE_EXT ".cache"
+
+typedef struct {
+    int is_constant;
+    long count;
+    double start;
+    double end;
+    double *timestamps; // NULL if is_constant, otherwise array of size count
+} FileSummary;
+
 typedef struct {
     char *path;
     double timestamp;
@@ -248,6 +260,74 @@ int read_header_keyword(const char *filepath, const char *key, char *value_out) 
     return found;
 }
 
+void ensure_cache_dir_exists(const char *parent_dir) {
+    char cache_path[1024];
+    snprintf(cache_path, sizeof(cache_path), "%s/%s", parent_dir, CACHE_DIR);
+    struct stat st = {0};
+    if (stat(cache_path, &st) == -1) {
+        mkdir(cache_path, 0755);
+    }
+}
+
+int read_cache(const char *cache_path, FileSummary *summary) {
+    FILE *fp = fopen(cache_path, "r");
+    if (!fp) return 0;
+
+    char type[32];
+    if (fscanf(fp, "%31s", type) != 1) { fclose(fp); return 0; }
+
+    if (strcmp(type, "CONSTANT") == 0) {
+        summary->is_constant = 1;
+        if (fscanf(fp, "%ld %lf %lf", &summary->count, &summary->start, &summary->end) != 3) {
+            fclose(fp);
+            return 0;
+        }
+        summary->timestamps = NULL;
+    } else if (strcmp(type, "RAW") == 0) {
+        summary->is_constant = 0;
+        if (fscanf(fp, "%ld", &summary->count) != 1) {
+             fclose(fp); return 0;
+        }
+        summary->timestamps = malloc(summary->count * sizeof(double));
+        for (long i = 0; i < summary->count; i++) {
+            if (fscanf(fp, "%lf", &summary->timestamps[i]) != 1) {
+                free(summary->timestamps);
+                fclose(fp);
+                return 0;
+            }
+        }
+        // If count > 0, set start/end
+        if (summary->count > 0) {
+            summary->start = summary->timestamps[0];
+            summary->end = summary->timestamps[summary->count - 1];
+        } else {
+            summary->start = 0;
+            summary->end = 0;
+        }
+    } else {
+        fclose(fp);
+        return 0;
+    }
+
+    fclose(fp);
+    return 1;
+}
+
+void write_cache(const char *cache_path, const FileSummary *summary) {
+    FILE *fp = fopen(cache_path, "w");
+    if (!fp) return;
+
+    if (summary->is_constant) {
+        fprintf(fp, "CONSTANT %ld %.9f %.9f\n", summary->count, summary->start, summary->end);
+    } else {
+        fprintf(fp, "RAW %ld\n", summary->count);
+        for (long i = 0; i < summary->count; i++) {
+            fprintf(fp, "%.9f\n", summary->timestamps[i]);
+        }
+    }
+    fclose(fp);
+}
+
 // Global context for keyword scanning
 KeyScanContext kscan_ctx;
 
@@ -390,6 +470,101 @@ double parse_filename_time(const char *filename, const char *date_str) {
     return (double)t + frac_sec;
 }
 
+void get_file_data(const char *filepath, FileSummary *summary) {
+    // Construct cache path
+    char *dir_sep = strrchr(filepath, '/');
+    char cache_path[1024];
+    if (dir_sep) {
+        char dir_path[1024];
+        size_t dir_len = dir_sep - filepath;
+        strncpy(dir_path, filepath, dir_len);
+        dir_path[dir_len] = '\0';
+        snprintf(cache_path, sizeof(cache_path), "%s/%s/%s%s", dir_path, CACHE_DIR, dir_sep + 1, CACHE_EXT);
+    } else {
+         snprintf(cache_path, sizeof(cache_path), "%s/%s%s", CACHE_DIR, filepath, CACHE_EXT);
+    }
+
+    if (read_cache(cache_path, summary)) {
+        return;
+    }
+
+    // Cache miss, process text file
+    summary->is_constant = 0;
+    summary->count = 0;
+    summary->timestamps = NULL;
+    summary->start = 0;
+    summary->end = 0;
+
+    FILE *fp = fopen(filepath, "r");
+    if (!fp) return;
+
+    // Use a temporary dynamic array to store timestamps
+    size_t cap = 1000;
+    double *ts_arr = malloc(cap * sizeof(double));
+    long count = 0;
+
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '#') continue;
+        char *token = strtok(line, " \t");
+        int col = 0;
+        double timestamp = 0.0;
+        int found = 0;
+        while (token) {
+            if (col == 4) { timestamp = atof(token); found = 1; break; }
+            token = strtok(NULL, " \t");
+            col++;
+        }
+        if (found) {
+            if (count == cap) {
+                cap *= 2;
+                ts_arr = realloc(ts_arr, cap * sizeof(double));
+            }
+            ts_arr[count++] = timestamp;
+        }
+    }
+    fclose(fp);
+
+    summary->count = count;
+    summary->timestamps = ts_arr;
+    if (count > 0) {
+        summary->start = ts_arr[0];
+        summary->end = ts_arr[count - 1];
+    }
+
+    // Analyze for constant frame rate
+    if (count > 2) {
+        double dt_sum = 0;
+        for (long i = 0; i < count - 1; i++) {
+            dt_sum += (ts_arr[i+1] - ts_arr[i]);
+        }
+        double mean_dt = dt_sum / (count - 1);
+        int constant = 1;
+        for (long i = 0; i < count - 1; i++) {
+            double dt = ts_arr[i+1] - ts_arr[i];
+            if (fabs(dt - mean_dt) > 0.05 * mean_dt) {
+                constant = 0;
+                break;
+            }
+        }
+        if (constant) {
+            summary->is_constant = 1;
+            free(summary->timestamps);
+            summary->timestamps = NULL;
+        }
+    }
+
+    // Write cache
+    if (dir_sep) {
+        char dir_path[1024];
+        size_t dir_len = dir_sep - filepath;
+        strncpy(dir_path, filepath, dir_len);
+        dir_path[dir_len] = '\0';
+        ensure_cache_dir_exists(dir_path);
+    }
+    write_cache(cache_path, summary);
+}
+
 // pass 0 = count frames and populate file list, pass 1 = binning and headers (using cached files)
 void scan_stream_dir(const char *path, const char *stream_name, double tstart, double tend, StreamList *streams, int num_bins, int pass, long *file_count) {
     if (pass != 0) return; // Only used for pass 0 now
@@ -490,25 +665,50 @@ void scan_stream_dir(const char *path, const char *stream_name, double tstart, d
             add_file_to_stream(s, filepath, file_ts);
 
             // Pass 0: Count frames
-            FILE *fp = fopen(filepath, "r");
-            if (fp) {
-                char line[1024];
-                while (fgets(line, sizeof(line), fp)) {
-                    if (line[0] == '#') continue;
-                    char *token = strtok(line, " \t");
-                    int col = 0;
-                    double timestamp = 0.0;
-                    int found = 0;
-                    while (token) {
-                        if (col == 4) { timestamp = atof(token); found = 1; break; }
-                        token = strtok(NULL, " \t");
-                        col++;
-                    }
-                    if (found && timestamp >= tstart && timestamp <= tend) {
-                        s->total_frames++;
+            FileSummary summary;
+            get_file_data(filepath, &summary);
+
+            // If constant, we can check overlap with [tstart, tend] analytically
+            if (summary.is_constant) {
+                if (summary.count > 0) {
+                    // Check if file range overlaps with scan range
+                    if (summary.end >= tstart && summary.start <= tend) {
+                        // Count frames inside [tstart, tend]
+                        // Assume linear distribution
+                        if (summary.start >= tstart && summary.end <= tend) {
+                            s->total_frames += summary.count;
+                        } else {
+                            // Partial overlap
+                             double dt = (summary.end - summary.start) / (summary.count > 1 ? summary.count - 1 : 1);
+                             if (dt > 0) {
+                                 double first_t = summary.start;
+                                 long start_idx = 0;
+                                 if (first_t < tstart) {
+                                     start_idx = (long)ceil((tstart - first_t) / dt);
+                                 }
+                                 long end_idx = summary.count - 1;
+                                 if (summary.end > tend) {
+                                     end_idx = (long)floor((tend - first_t) / dt);
+                                 }
+                                 if (start_idx <= end_idx) {
+                                     s->total_frames += (end_idx - start_idx + 1);
+                                 }
+                             } else {
+                                 // Single frame
+                                 if (summary.start >= tstart && summary.start <= tend) s->total_frames++;
+                             }
+                        }
                     }
                 }
-                fclose(fp);
+            } else {
+                if (summary.timestamps) {
+                    for (long k = 0; k < summary.count; k++) {
+                        if (summary.timestamps[k] >= tstart && summary.timestamps[k] <= tend) {
+                            s->total_frames++;
+                        }
+                    }
+                    free(summary.timestamps);
+                }
             }
         }
         free(namelist[i]);
@@ -560,31 +760,62 @@ void process_stream_data(StreamList *stream_list, double tstart, double tend, in
             }
 
             // Binning
-            FILE *fp = fopen(filepath, "r");
-            if (fp) {
-                char line[1024];
-                while (fgets(line, sizeof(line), fp)) {
-                    if (line[0] == '#') continue;
-                    char *token = strtok(line, " \t");
-                    int col = 0;
-                    double timestamp = 0.0;
-                    int found = 0;
-                    while (token) {
-                        if (col == 4) { timestamp = atof(token); found = 1; break; }
-                        token = strtok(NULL, " \t");
-                        col++;
-                    }
-                    if (found && timestamp >= tstart && timestamp <= tend) {
-                        int bin = (int)((timestamp - tstart) / (tend - tstart) * num_bins);
-                        if (bin < 0) bin = 0;
-                        if (bin >= num_bins) bin = num_bins - 1;
-                        s->bins[bin]++;
-                        if (s->bins[bin] > s->max_bin_count) {
-                            s->max_bin_count = s->bins[bin];
+            FileSummary summary;
+            get_file_data(filepath, &summary);
+
+            if (summary.is_constant) {
+                if (summary.count > 0 && summary.end >= tstart && summary.start <= tend) {
+                    double dt = (summary.end - summary.start) / (summary.count > 1 ? summary.count - 1 : 1);
+                    if (dt > 0) {
+                        double first_t = summary.start;
+                        long start_idx = 0;
+                         if (first_t < tstart) {
+                             start_idx = (long)ceil((tstart - first_t) / dt);
+                         }
+                         long end_idx = summary.count - 1;
+                         if (summary.end > tend) {
+                             end_idx = (long)floor((tend - first_t) / dt);
+                         }
+
+                         for (long k = start_idx; k <= end_idx; k++) {
+                             double timestamp = first_t + k * dt;
+                             int bin = (int)((timestamp - tstart) / (tend - tstart) * num_bins);
+                             if (bin < 0) bin = 0;
+                             if (bin >= num_bins) bin = num_bins - 1;
+                             s->bins[bin]++;
+                             if (s->bins[bin] > s->max_bin_count) {
+                                 s->max_bin_count = s->bins[bin];
+                             }
+                         }
+                    } else {
+                        // Single frame
+                        if (summary.start >= tstart && summary.start <= tend) {
+                             int bin = (int)((summary.start - tstart) / (tend - tstart) * num_bins);
+                             if (bin < 0) bin = 0;
+                             if (bin >= num_bins) bin = num_bins - 1;
+                             s->bins[bin]++;
+                             if (s->bins[bin] > s->max_bin_count) {
+                                 s->max_bin_count = s->bins[bin];
+                             }
                         }
                     }
                 }
-                fclose(fp);
+            } else {
+                 if (summary.timestamps) {
+                    for (long k = 0; k < summary.count; k++) {
+                        double timestamp = summary.timestamps[k];
+                        if (timestamp >= tstart && timestamp <= tend) {
+                            int bin = (int)((timestamp - tstart) / (tend - tstart) * num_bins);
+                            if (bin < 0) bin = 0;
+                            if (bin >= num_bins) bin = num_bins - 1;
+                            s->bins[bin]++;
+                            if (s->bins[bin] > s->max_bin_count) {
+                                s->max_bin_count = s->bins[bin];
+                            }
+                        }
+                    }
+                    free(summary.timestamps);
+                 }
             }
         }
     }
