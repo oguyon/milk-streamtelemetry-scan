@@ -473,10 +473,11 @@ double parse_filename_time(const char *filename, const char *date_str) {
 void get_file_data(const char *filepath, FileSummary *summary) {
     // Construct cache path
     char *dir_sep = strrchr(filepath, '/');
-    char cache_path[1024];
+    char cache_path[8192];
     if (dir_sep) {
-        char dir_path[1024];
+        char dir_path[4096];
         size_t dir_len = dir_sep - filepath;
+        if (dir_len >= sizeof(dir_path)) dir_len = sizeof(dir_path) - 1;
         strncpy(dir_path, filepath, dir_len);
         dir_path[dir_len] = '\0';
         snprintf(cache_path, sizeof(cache_path), "%s/%s/%s%s", dir_path, CACHE_DIR, dir_sep + 1, CACHE_EXT);
@@ -849,7 +850,7 @@ void get_date_bounds(const char *root_dir, const char *date_str, double *t_min, 
                     struct dirent *fdir = filelist[j];
                     size_t len = strlen(fdir->d_name);
                     if (len > 4 && strcmp(fdir->d_name + len - 4, ".txt") == 0) {
-                        char filepath[2048];
+                        char filepath[4096];
                         snprintf(filepath, sizeof(filepath), "%s/%s", stream_path, fdir->d_name);
                         FILE *fp = fopen(filepath, "r");
                         if (fp) {
