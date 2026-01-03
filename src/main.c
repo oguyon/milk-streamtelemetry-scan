@@ -365,6 +365,9 @@ void write_cache(const char *cache_path, const FileSummary *summary) {
 // Global context for keyword scanning
 KeyScanContext kscan_ctx;
 int g_cache_export = 0;
+long g_cache_searched = 0;
+long g_cache_found = 0;
+long g_cache_created = 0;
 
 TrackedKey* get_tracked_key(const char *stream, const char *key) {
     for (int i = 0; i < kscan_ctx.tracked_count; i++) {
@@ -506,6 +509,7 @@ double parse_filename_time(const char *filename, const char *date_str) {
 }
 
 void get_file_data(const char *filepath, FileSummary *summary) {
+    g_cache_searched++;
     // Construct both potential cache paths
     char local_cache_path[8192];
     snprintf(local_cache_path, sizeof(local_cache_path), "%s/%s%s", CACHE_DIR, filepath, CACHE_EXT);
@@ -527,11 +531,11 @@ void get_file_data(const char *filepath, FileSummary *summary) {
     // Actually, user said: "The program will look for the cache in both location, and report if found."
     // We check local first.
     if (read_cache(local_cache_path, summary)) {
-        printf("Found cache in %s\n", local_cache_path);
+        g_cache_found++;
         return;
     }
     if (read_cache(export_cache_path, summary)) {
-        printf("Found cache in %s\n", export_cache_path);
+        g_cache_found++;
         return;
     }
 
@@ -618,6 +622,7 @@ void get_file_data(const char *filepath, FileSummary *summary) {
         ensure_path_exists(local_cache_path);
         write_cache(local_cache_path, summary);
     }
+    g_cache_created++;
 }
 
 // pass 0 = count frames and populate file list, pass 1 = binning and headers (using cached files)
@@ -1328,5 +1333,8 @@ int main(int argc, char *argv[]) {
     if (kscan_ctx.tracked_keys) free(kscan_ctx.tracked_keys);
     if (kscan_ctx.target_key_pattern[0] != '\0') regfree(&kscan_ctx.key_regex);
     free_stream_list(&stream_list);
+
+    printf("\nCache: searched %ld, found %ld, created %ld\n", g_cache_searched, g_cache_found, g_cache_created);
+
     return 0;
 }
