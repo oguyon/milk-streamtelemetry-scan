@@ -125,6 +125,7 @@ int g_no_cache = 0;
 long g_cache_searched = 0;
 long g_cache_found = 0;
 long g_cache_created = 0;
+int g_products_found_in_time_bracket = 0;
 
 // Binary Cache Globals
 int g_use_binary_cache = 0;
@@ -1032,10 +1033,33 @@ void get_file_data(const char *filepath, FileSummary *summary) {
 void scan_stream_dir(const char *path, const char *stream_name, double tstart, double tend, StreamList *streams, int num_bins, int pass, long *file_count) {
     if (pass != 0) return; // Only used for pass 0 now
 
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        fprintf(stderr, "Error: Directory not found or inaccessible: %s\n", path);
+        return;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "Error: Path is not a directory: %s\n", path);
+        return;
+    }
+
     printf("Scanning %s\n", path);
     struct dirent **namelist;
     int n = scandir(path, &namelist, NULL, alphasort);
-    if (n < 0) return;
+    if (n < 0) {
+        fprintf(stderr, "Error scanning directory %s: %s\n", path, strerror(errno));
+        return;
+    }
+
+    // Check if the directory is empty (excluding . and ..)
+    if (n <= 2) {
+        fprintf(stderr, "Warning: Directory %s is empty (contains only '.' and '..').\n", path);
+        for (int i = 0; i < n; i++) {
+            free(namelist[i]);
+        }
+        free(namelist);
+        return;
+    }
 
     // Get date from path (parent directory name)
     // path format: .../YYYYMMDD/stream_name
@@ -1155,24 +1179,28 @@ void scan_stream_dir(const char *path, const char *stream_name, double tstart, d
                                  }
                                  if (start_idx <= end_idx) {
                                      s->total_frames += (end_idx - start_idx + 1);
+                                     g_products_found_in_time_bracket = 1;
                                  }
                              } else {
                                  // Single frame
-                                 if (summary.start >= tstart && summary.start <= tend) s->total_frames++;
+                                 if (summary.start >= tstart && summary.start <= tend) {
+                                     s->total_frames++;
+                                     g_products_found_in_time_bracket = 1;
+                                 }
                              }
                         }
                     }
                 }
             } else {
-                if (summary.timestamps) {
-                    for (long k = 0; k < summary.count; k++) {
-                        if (summary.timestamps[k] >= tstart && summary.timestamps[k] <= tend) {
-                            s->total_frames++;
-                        }
-                    }
-                    free(summary.timestamps);
-                }
-            }
+                                 if (summary.timestamps) {
+                                    for (long k = 0; k < summary.count; k++) {
+                                        if (summary.timestamps[k] >= tstart && summary.timestamps[k] <= tend) {
+                                            s->total_frames++;
+                                            g_products_found_in_time_bracket = 1;
+                                        }
+                                    }
+                                    free(summary.timestamps);
+                                 }            }
         }
         free(namelist[i]);
     }
@@ -1451,6 +1479,21 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // Check if the root directory exists and is a directory
+    if (root_dir == NULL) {
+        fprintf(stderr, "Error: Root directory not provided.\n");
+        return 1;
+    }
+    struct stat st_root;
+    if (stat(root_dir, &st_root) != 0) {
+        fprintf(stderr, "Error: Root directory not found or inaccessible: %s\n", root_dir);
+        return 1;
+    }
+    if (!S_ISDIR(st_root.st_mode)) {
+        fprintf(stderr, "Error: Root directory is not a directory: %s\n", root_dir);
+        return 1;
+    }
+
     double tstart = parse_time_arg(tstart_str);
     double tend = 0.0;
 
@@ -1502,6 +1545,11 @@ int main(int argc, char *argv[]) {
     if (g_profile) t_disc_start = get_current_time();
     process_all_dates(root_dir, tstart, tend, &stream_list, 0, 0, &file_count);
     if (g_profile) g_prof.discovery_time += (get_current_time() - t_disc_start);
+
+    if (g_products_found_in_time_bracket == 0) {
+        printf("No products found within the specified time bracket.\n");
+        return 0; // Exit if no products found
+    }
 
     // Calculate formatting
     int max_name_len = 10;
